@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<!--
+SPDX-FileCopyrightText: 2026 Famedly GmbH (info@famedly.com)
+
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>admin2136</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+
+<header id="toolbar">
+  <div id="brand">
+    <span id="brand-name">admin2136</span>
+    <span id="brand-sub">AXFR / RFC&nbsp;2136 zone editor</span>
+  </div>
+  <span id="brand-sep" class="zone-only">/</span>
+  <div id="zone-title" class="zone-only">
+    <span id="zone-name"></span>
+    <span id="zone-meta"></span>
+  </div>
+  <input id="filter" class="zone-only" type="search" placeholder="Filter records…" spellcheck="false">
+  <button id="add-btn" class="zone-only">+ Add record</button>
+  <button id="refresh-btn" class="zone-only" title="Reload the zone via AXFR (IXFR planned)">⟳ Refresh</button>
+  <button id="about-btn" title="About admin2136">About</button>
+</header>
+
+<section id="login-view">
+  <form id="login-form" autocomplete="off">
+    <label class="has-sublink">DNS over WebSocket proxy URL
+      <input type="url" pattern="wss?://.*" id="proxy-url" required spellcheck="false">
+    </label>
+    <div class="proxy-about">
+      <a id="proxy-about-link" target="_blank" rel="noreferrer">About proxy</a>
+    </div>
+    <label>Nameserver (host[:port])
+      <input id="nameserver" required spellcheck="false">
+    </label>
+    <label>Zone
+      <input id="zone" required spellcheck="false">
+    </label>
+    <label>TSIG secret (for client-side signature processing)
+      <input id="tsig" type="password" spellcheck="false">
+    </label>
+    <button type="submit" id="login-btn">Login</button>
+    <div id="login-status" class="status" role="status"></div>
+  </form>
+</section>
+
+<section id="zone-view" hidden>
+  <div id="list-header" class="record-grid">
+    <span>Name</span><span>TTL</span><span>Type</span><span>Data</span><span></span>
+  </div>
+  <div id="record-list"></div>
+  <footer id="status-bar" role="status"></footer>
+</section>
+
+<dialog id="edit-dialog">
+  <form id="edit-form" autocomplete="off">
+    <h2 id="edit-title">Edit record</h2>
+    <label>Name
+      <input id="edit-name" placeholder="@ for zone apex" spellcheck="false">
+    </label>
+    <div class="field-row">
+      <label>TTL
+        <input id="edit-ttl" type="number" min="0" max="2147483647" value="3600" required>
+      </label>
+      <label>Type
+        <select id="edit-type">
+          <option>A</option>
+          <option>AAAA</option>
+          <option>CNAME</option>
+          <option>TXT</option>
+          <option>SSHFP</option>
+        </select>
+      </label>
+    </div>
+    <label>Data
+      <textarea id="edit-data" rows="3" spellcheck="false"></textarea>
+    </label>
+    <div class="dialog-buttons">
+      <button type="button" id="edit-cancel">Cancel</button>
+      <button type="submit" id="edit-save">Save</button>
+    </div>
+    <div id="edit-status" class="status" role="status"></div>
+  </form>
+</dialog>
+
+<dialog id="about-dialog">
+  <h2>admin2136</h2>
+  <p>A web frontend for DNS zone management via AXFR and RFC&nbsp;2136
+  dynamic updates, authenticated with TSIG, transported with DNS
+  over WebSocket.</p>
+  <p>Source available at https://github.com/famedly/admin2136/commit/<wbr>{{ git_commit_hash }}</p>
+  <p id="about-proxy" hidden>
+    <a id="about-proxy-link" target="_blank" rel="noreferrer">About proxy</a>
+  </p>
+  <div class="dialog-buttons">
+    <button type="button" id="about-close">Close</button>
+  </div>
+</dialog>
+
+</body>
+</html>

@@ -1,0 +1,366 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Famedly GmbH (info@famedly.com)
+ *
+ * SPDX-License-Identifier: AGPL-3.0-or-later
+ */
+
+:root {
+    --bg: #14171c;
+    --bg-alt: #1c2027;
+    --bg-hover: #242a33;
+    --border: #303743;
+    --fg: #d7dde6;
+    --fg-dim: #8792a2;
+    --accent: #4d9fff;
+    --accent-fg: #ffffff;
+    --danger: #ff6b6b;
+    --ok: #5fd38a;
+    --mono:
+        ui-monospace, "SF Mono", "Cascadia Mono", Consolas, Menlo, monospace;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font:
+        14px/1.4 system-ui,
+        sans-serif;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+}
+
+button {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    cursor: pointer;
+}
+button:hover:not(:disabled) {
+    background: var(--bg-hover);
+}
+button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+button[type="submit"] {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-fg);
+}
+button[type="submit"]:hover:not(:disabled) {
+    filter: brightness(1.1);
+    background: var(--accent);
+}
+
+input,
+select,
+textarea {
+    font: inherit;
+    color: var(--fg);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    width: 100%;
+}
+input:focus,
+select:focus,
+textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+}
+textarea {
+    font-family: var(--mono);
+    resize: vertical;
+}
+
+label {
+    display: block;
+    margin-bottom: 12px;
+    color: var(--fg-dim);
+    font-size: 13px;
+}
+label > input,
+label > select,
+label > textarea {
+    margin-top: 4px;
+}
+
+.status {
+    margin-top: 10px;
+    color: var(--fg-dim);
+    white-space: pre-wrap;
+}
+
+/* ---- login ---- */
+
+#login-view {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+}
+/* The display:flex above would override the UA's [hidden] rule. */
+#login-view[hidden] {
+    display: none;
+}
+#login-form {
+    /* margin:auto centers, but unlike align-items it never clips the top
+       of the form on small viewports when the view scrolls */
+    margin: auto;
+    width: 420px;
+    max-width: 100%;
+    background: var(--bg-alt);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 28px;
+}
+/* Shift the button down a bit: the 8px added above are taken from the
+   status line's margin below, so the form height stays the same. */
+#login-form button[type="submit"] {
+    width: 100%;
+    padding: 8px;
+    margin-top: 8px;
+}
+#login-status {
+    margin-top: 2px;
+}
+#login-form input {
+    font-family: var(--mono);
+}
+#login-form label {
+    margin-bottom: 24px;
+}
+#login-form label.has-sublink {
+    margin-bottom: 4px;
+}
+.proxy-about {
+    font-size: 12px;
+    line-height: 16px;
+    margin: 0 0 6px;
+    text-align: right;
+}
+.proxy-about a:not([href]) {
+    visibility: hidden;
+}
+
+a {
+    color: var(--accent);
+}
+
+/* ---- zone view ---- */
+
+#zone-view {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+#zone-view[hidden] {
+    display: none;
+}
+
+#toolbar {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px 14px;
+    background: var(--bg-alt);
+    border-bottom: 1px solid var(--border);
+}
+#brand {
+    display: flex;
+    flex-direction: column;
+    line-height: 1.25;
+    white-space: nowrap;
+}
+#brand-name {
+    font-weight: 600;
+    font-family: var(--mono);
+}
+#brand-sub {
+    font-size: 11px;
+    color: var(--fg-dim);
+}
+/* Zone controls only appear once a zone is loaded; the About button (and
+   the brand) stay visible on the login screen too. */
+#toolbar:not(.zone-active) .zone-only {
+    display: none;
+}
+#toolbar:not(.zone-active) #about-btn {
+    margin-left: auto;
+}
+/* Tall slash separating the app title from the zone title. */
+#brand-sep {
+    font-size: 28px;
+    font-weight: 300;
+    line-height: 1;
+    color: var(--fg-dim);
+    user-select: none;
+}
+#zone-title {
+    /* Two rows (zone name over record count / serial), matching #brand. */
+    display: flex;
+    flex-direction: column;
+    line-height: 1.25;
+    flex: 0 1 auto;
+    margin-right: auto;
+    white-space: nowrap;
+    overflow: hidden;
+}
+#zone-name {
+    font-weight: 600;
+    font-family: var(--mono);
+}
+#zone-meta {
+    font-size: 11px;
+    color: var(--fg-dim);
+}
+#filter {
+    width: 260px;
+}
+
+.record-grid {
+    display: grid;
+    grid-template-columns: minmax(140px, 1fr) 76px 96px minmax(200px, 3fr) 76px;
+    gap: 10px;
+    align-items: center;
+    padding: 0 14px;
+}
+
+#list-header {
+    height: 30px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-dim);
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-alt);
+}
+
+#record-list {
+    flex: 1;
+    overflow-y: auto;
+    position: relative;
+}
+.vlist-inner {
+    position: relative;
+    width: 100%;
+}
+.vlist-row {
+    position: absolute;
+    left: 0;
+    right: 0;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 13px;
+}
+.vlist-row:hover {
+    background: var(--bg-hover);
+}
+.vlist-row > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.vlist-row .c-name {
+    text-align: right;
+}
+.vlist-row .c-ttl {
+    color: var(--fg-dim);
+    text-align: right;
+}
+.vlist-row .c-type {
+    color: var(--accent);
+}
+.vlist-row.readonly .c-type {
+    color: var(--fg-dim);
+}
+.vlist-row .c-actions {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
+    overflow: visible;
+}
+.vlist-row .c-actions button {
+    padding: 1px 8px;
+    font-size: 13px;
+    line-height: 1.5;
+    background: transparent;
+    border-color: transparent;
+}
+.vlist-row .c-actions button:hover:not(:disabled) {
+    background: var(--bg);
+    border-color: var(--border);
+}
+.vlist-row .row-del:hover:not(:disabled) {
+    color: var(--danger);
+}
+
+#status-bar {
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--fg-dim);
+    background: var(--bg-alt);
+    border-top: 1px solid var(--border);
+    min-height: 28px;
+    white-space: pre-wrap;
+}
+#status-bar.error {
+    color: var(--danger);
+}
+#status-bar.ok {
+    color: var(--ok);
+}
+
+/* ---- edit dialog ---- */
+
+dialog {
+    background: var(--bg-alt);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+    width: 460px;
+    max-width: calc(100vw - 32px);
+}
+dialog::backdrop {
+    background: rgba(0, 0, 0, 0.55);
+}
+dialog h2 {
+    margin: 0 0 18px;
+    font-size: 18px;
+}
+dialog input,
+dialog textarea {
+    font-family: var(--mono);
+}
+.field-row {
+    display: flex;
+    gap: 12px;
+}
+.field-row > label {
+    flex: 1;
+}
+.dialog-buttons {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 6px;
+}
