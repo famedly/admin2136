@@ -84,12 +84,61 @@ in
     # registry (docker-oss), everything else (PRs, main) goes to the
     # nightly registry (docker-nightly). The per-architecture images
     # are combined into a single multi-arch manifest.
+    #
+    # The registry authenticates the workflow with a GitHub Actions
+    # OIDC token (JWT). GitHub never grants id-token: write to pull
+    # requests from forks, so the job is skipped for them.
     jobs.docker = {
       runsOn = "ubuntu-latest";
-      if_ = "github.event_name == 'push' || github.event_name == 'pull_request'";
+      if_ = "github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)";
       needs = [ "build" ];
 
+      permissions = {
+        # Required for the runner to expose
+        # ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN.
+        id-token = "write";
+        contents = "read";
+      };
+
       steps = [
+        {
+          # Instead of `podman login` (which writes the token to an auth
+          # file), install a credential helper. Podman invokes it on
+          # demand and it mints a fresh OIDC token each time, so nothing
+          # is persisted and token expiry during long jobs is a
+          # non-issue.
+          name = "Install OIDC credential helper for registry.famedly.net";
+          run = ''
+            set -euo pipefail
+
+            bin="$RUNNER_TEMP/bin/docker-credential-gha-oidc"
+            mkdir -p "$(dirname "$bin")"
+            cat > "$bin" <<'EOF'
+            #!/usr/bin/env bash
+            # Docker credential helper, also understood by podman
+            # https://github.com/docker/docker-credential-helpers#development
+            set -euo pipefail
+            if [[ "''${1:-}" != get ]]; then
+              echo "unsupported operation: ''${1:-<none>}" >&2
+              exit 1
+            fi
+            IFS= read -r server || [[ -n "$server" ]]
+            curl -sSfG --data-urlencode "audience=https://$server" \
+              -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+            jq --arg s "$server" \
+              '{ServerURL: $s, Username: "__jwt", Secret: (.value // error("response has no .value"))}'
+            EOF
+            chmod +x "$bin"
+            echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+
+            # Podman looks up credential helpers in its auth file
+            # (containers-auth.json(5)).
+            auth="$RUNNER_TEMP/containers-auth.json"
+            jq -n '.credHelpers["registry.famedly.net"] = "gha-oidc"' > "$auth"
+            echo "REGISTRY_AUTH_FILE=$auth" >> "$GITHUB_ENV"
+          '';
+        }
+
         {
           name = "Download Docker images";
           uses = download-artifact;
@@ -102,8 +151,6 @@ in
         {
           name = "Push multi-arch Docker manifest to registry";
           env = {
-            REGISTRY_USER = "\${{ vars.REGISTRY_USER }}";
-            REGISTRY_PASSWORD = "\${{ secrets.registry_password || secrets.GITHUB_TOKEN }}";
             TAG = "\${{ github.head_ref || github.ref_name || 'latest' }}";
           };
           run = ''
@@ -112,9 +159,6 @@ in
             else
               registry=registry.famedly.net/docker-nightly
             fi
-
-            echo "$REGISTRY_PASSWORD" \
-              | podman login registry.famedly.net -u "$REGISTRY_USER" --password-stdin
 
             image="$registry/admin2136"
             # Branch names may contain slashes, which are not valid in

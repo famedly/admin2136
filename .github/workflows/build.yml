@@ -27,19 +27,49 @@ jobs:
           - arch: aarch64
             runner: ubuntu-26.04-arm
   docker:
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
     needs:
       - build
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     steps:
+      - name: Install OIDC credential helper for registry.famedly.net
+        run: |
+          set -euo pipefail
+
+          bin="$RUNNER_TEMP/bin/docker-credential-gha-oidc"
+          mkdir -p "$(dirname "$bin")"
+          cat > "$bin" <<'EOF'
+          #!/usr/bin/env bash
+          # Docker credential helper, also understood by podman
+          # https://github.com/docker/docker-credential-helpers#development
+          set -euo pipefail
+          if [[ "${1:-}" != get ]]; then
+            echo "unsupported operation: ${1:-<none>}" >&2
+            exit 1
+          fi
+          IFS= read -r server || [[ -n "$server" ]]
+          curl -sSfG --data-urlencode "audience=https://$server" \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL" |
+          jq --arg s "$server" \
+            '{ServerURL: $s, Username: "__jwt", Secret: (.value // error("response has no .value"))}'
+          EOF
+          chmod +x "$bin"
+          echo "$(dirname "$bin")" >> "$GITHUB_PATH"
+
+          # Podman looks up credential helpers in its auth file
+          # (containers-auth.json(5)).
+          auth="$RUNNER_TEMP/containers-auth.json"
+          jq -n '.credHelpers["registry.famedly.net"] = "gha-oidc"' > "$auth"
+          echo "REGISTRY_AUTH_FILE=$auth" >> "$GITHUB_ENV"
       - name: Download Docker images
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           path: artifacts
           pattern: docker-image-*
       - env:
-          REGISTRY_PASSWORD: ${{ secrets.registry_password || secrets.GITHUB_TOKEN }}
-          REGISTRY_USER: ${{ vars.REGISTRY_USER }}
           TAG: ${{ github.head_ref || github.ref_name || 'latest' }}
         name: Push multi-arch Docker manifest to registry
         run: |
@@ -48,9 +78,6 @@ jobs:
           else
             registry=registry.famedly.net/docker-nightly
           fi
-
-          echo "$REGISTRY_PASSWORD" \
-            | podman login registry.famedly.net -u "$REGISTRY_USER" --password-stdin
 
           image="$registry/admin2136"
           # Branch names may contain slashes, which are not valid in
