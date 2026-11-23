@@ -9,15 +9,17 @@ import { axfr, sendUpdate } from "./dnsops.js";
 import { parseTsigSpec } from "./tsig.js";
 import { ZoneStore } from "./zonestore.js";
 import { VirtualList } from "./vlist.js";
-import { rdataToText, textToRdata, soaSerial } from "./rdata.js";
+import {
+  rdataToText,
+  textToRdata,
+  soaSerial,
+  isEditableType,
+  typeHint,
+  EDITABLE_TYPES,
+} from "./rdata.js";
 import {
   typeToName,
   nameToType,
-  TYPE_A,
-  TYPE_AAAA,
-  TYPE_CNAME,
-  TYPE_TXT,
-  TYPE_SSHFP,
   TYPE_SOA,
   CLASS_IN,
   CLASS_NONE,
@@ -25,13 +27,6 @@ import {
 
 const $ = (id) => document.getElementById(id);
 
-const EDITABLE_TYPES = new Set([
-  TYPE_A,
-  TYPE_AAAA,
-  TYPE_CNAME,
-  TYPE_TXT,
-  TYPE_SSHFP,
-]);
 const ROW_HEIGHT = 30;
 const SETTINGS_KEY = "admin2136-settings";
 
@@ -160,7 +155,7 @@ function renderRow(i, el) {
   c.type.textContent = typeToName(r.type);
   c.data.textContent = data;
   c.data.title = data;
-  const editable = EDITABLE_TYPES.has(r.type);
+  const editable = isEditableType(r.type);
   c.edit.disabled = !editable;
   c.del.disabled = r.type === TYPE_SOA;
   el.classList.toggle("readonly", !editable);
@@ -414,8 +409,20 @@ function openEditor(rec) {
     $("edit-type").value = typeToName(r.type);
     $("edit-data").value = rdataToText(r.type, r.rdata);
   }
+  updateDataHint();
   $("edit-dialog").showModal();
 }
+
+function updateDataHint() {
+  $("edit-data").placeholder = typeHint(nameToType($("edit-type").value));
+}
+
+for (const t of EDITABLE_TYPES) {
+  const opt = document.createElement("option");
+  opt.textContent = typeToName(t);
+  $("edit-type").appendChild(opt);
+}
+$("edit-type").addEventListener("change", updateDataHint);
 
 $("add-btn").addEventListener("click", () => openEditor(null));
 $("edit-cancel").addEventListener("click", () => $("edit-dialog").close());

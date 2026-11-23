@@ -37,6 +37,9 @@ import {
   genericToText,
   parseGeneric,
   soaSerial,
+  isEditableType,
+  typeHint,
+  EDITABLE_TYPES,
 } from "../js/rdata.js";
 
 let failures = 0;
@@ -172,6 +175,185 @@ check(
     }
   })(),
 );
+
+// Presentation format round trips for all supported types: parsing the
+// text and formatting the result again must reproduce the input.
+{
+  const abs = (n) => (n.endsWith(".") ? n : n + ".example.com.");
+  const cases = [
+    ["NS", "ns1.example.com."],
+    ["PTR", "host.example.com."],
+    ["DNAME", "example.net."],
+    ["MX", "10 mail.example.com."],
+    ["AFSDB", "1 afs.example.com."],
+    ["RT", "10 relay.example.com."],
+    ["KX", "10 kx.example.com."],
+    ["RP", "admin.example.com. info.example.com."],
+    ["HINFO", '"PC" "Linux"'],
+    ["SPF", '"v=spf1 -all"'],
+    ["SRV", "0 5 5060 sip.example.com."],
+    ["NAPTR", '100 10 "S" "SIP+D2U" "" _sip._udp.example.com.'],
+    ["DS", "60485 5 1 2bb183af5f22588179a53b0a98631fad1a292118"],
+    ["CDS", "0 0 0 00"],
+    ["DNSKEY", "257 3 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+E="],
+    ["CDNSKEY", "0 3 0 AA=="],
+    ["CERT", "1 0 0 MIIB"],
+    ["DHCID", "AAIBY2/AuCccgoJbsaxcQc9TUapptP69lOjxfNuVAA2kjEA="],
+    ["NSEC3PARAM", "1 0 0 -"],
+    ["NSEC3PARAM", "1 0 10 aabbccdd"],
+    [
+      "TLSA",
+      "3 1 1 0c72ac70b745ac19998811b131d662c9ac69dbdbe7cb23e5b514b56664c5d3d6",
+    ],
+    ["SMIMEA", "3 0 0 308201"],
+    ["OPENPGPKEY", "mQINBFit2jsBEADrbl5vjVxYeAE0g0IDYCBpHirv1Sjlqxx5gjtPhb2Y"],
+    ["ZONEMD", "2021071219 1 1 aabbcc"],
+    ["URI", '10 1 "ftp://ftp1.example.com/public"'],
+    ["CAA", '0 issue "letsencrypt.org"'],
+    ["CAA", '128 iodef "mailto:security@example.com"'],
+    ["CAA", '0 issue ""'],
+    ["HTTPS", "1 ."],
+    ["HTTPS", "0 svc.example.net."],
+    [
+      "HTTPS",
+      '1 . alpn="h3,h2" ipv4hint=192.0.2.1,192.0.2.2 ech=AEX+DQBB ipv6hint=2001:db8::1',
+    ],
+    [
+      "SVCB",
+      '16 foo.example.org. mandatory=alpn,ipv4hint alpn="h2" ipv4hint=192.0.2.1',
+    ],
+    ["SVCB", '1 foo.example.com. port=53 dohpath="/dns-query{?dns}"'],
+    ["SVCB", "1 . no-default-alpn ohttp"],
+    ["SVCB", '1 . key667="hello"'],
+    ["SVCB", '1 . alpn="f\\\\\\\\oo\\\\,bar,h2"'],
+  ];
+  for (const [t, text] of cases) {
+    const type = nameToType(t);
+    check(t + " is editable", EDITABLE_TYPES.includes(type));
+    let got;
+    try {
+      got = rdataToText(type, textToRdata(type, text, abs));
+    } catch (e) {
+      got = "error: " + e.message;
+    }
+    eq(t + " roundtrip", got, text);
+  }
+
+  const wire = (t, text) => hex(textToRdata(nameToType(t), text, abs));
+  eq(
+    "MX relative name",
+    wire("MX", "10 mail"),
+    wire("MX", "10 mail.example.com."),
+  );
+  eq("CAA wire", wire("CAA", '0 issue "ca.net"'), "0005697373756563612e6e6574");
+  eq(
+    "CAA unquoted value",
+    wire("CAA", "0 issue ca.net; account=1"),
+    wire("CAA", '0 issue "ca.net; account=1"'),
+  );
+  eq(
+    "HTTPS wire (RFC 9460 D.2)",
+    wire(
+      "HTTPS",
+      "16 foo.example.org. alpn=h2,h3-19 mandatory=ipv4hint,alpn ipv4hint=192.0.2.1",
+    ),
+    "0010" +
+      "03666f6f076578616d706c65036f726700" +
+      "00000004" +
+      "00010004" +
+      "000100090268320568332d3139" +
+      "00040004c0000201",
+  );
+  eq(
+    "SVCB escaped alpn (RFC 9460 D.2)",
+    wire("SVCB", '16 foo.example.org. alpn="f\\\\\\\\oo\\\\,bar,h2"'),
+    wire("SVCB", "16 foo.example.org. alpn=f\\\\\\092oo\\092,bar,h2"),
+  );
+  eq(
+    "DNSKEY multi-line key",
+    wire("DNSKEY", "256 3 8 ( AwEAAa\n bc )"),
+    wire("DNSKEY", "256 3 8 AwEAAabc"),
+  );
+  eq(
+    "TLSA uppercase hex",
+    rdataToText(
+      nameToType("TLSA"),
+      textToRdata(nameToType("TLSA"), "3 1 1 AB CD"),
+    ),
+    "3 1 1 abcd",
+  );
+  eq("SOA is read-only", isEditableType(TYPE_SOA), false);
+  check("SOA is not offered", !EDITABLE_TYPES.includes(TYPE_SOA));
+  check("unknown type is read-only", !isEditableType(999));
+  check("CAA hint", typeHint(nameToType("CAA")).includes("issue"));
+
+  const throws = (what, fn, substr) => {
+    try {
+      fn();
+      check(what + " (throws)", false);
+    } catch (e) {
+      check(
+        what + ' ("' + e.message + '" contains "' + substr + '")',
+        e.message.includes(substr),
+      );
+    }
+  };
+  throws("MX missing exchange", () => wire("MX", "10"), "too few fields");
+  throws("MX extra field", () => wire("MX", "10 a b"), "too many fields");
+  throws("MX preference range", () => wire("MX", "70000 a"), "0 to 65535");
+  throws("CAA bad tag", () => wire("CAA", '0 is-sue "x"'), "invalid tag");
+  throws("DS odd hex", () => wire("DS", "1 2 3 abc"), "hex digits");
+  throws("DNSKEY bad base64", () => wire("DNSKEY", "256 3 8 a?b"), "base64");
+  throws("HTTPS unknown key", () => wire("HTTPS", "1 . foo=1"), "SvcParamKey");
+  throws(
+    "HTTPS duplicate key",
+    () => wire("HTTPS", "1 . port=1 port=2"),
+    "duplicate",
+  );
+  throws(
+    "HTTPS flag with value",
+    () => wire("HTTPS", "1 . ohttp=1"),
+    "no value",
+  );
+  throws("unterminated quote", () => wire("CAA", '0 issue "x'), "unterminated");
+
+  // Malformed wire data falls back to the generic representation.
+  eq(
+    "malformed MX shown generic",
+    rdataToText(nameToType("MX"), Uint8Array.of(0, 10)),
+    "\\# 2 000a",
+  );
+  eq(
+    "HTTPS unordered keys shown generic",
+    rdataToText(
+      nameToType("HTTPS"),
+      Uint8Array.of(0, 1, 0, 0, 3, 0, 2, 0, 1, 0, 1, 0, 0),
+    ).startsWith("\\#"),
+    true,
+  );
+}
+
+// Compressed names in SRV and NAPTR rdata are expanded on receipt.
+{
+  const w = new Writer();
+  w.u16(1).u16(0x8400).u16(1).u16(2).u16(0).u16(0);
+  w.name("example.com.").u16(TYPE_A).u16(CLASS_IN); // question at offset 12
+  w.u8(0xc0).u8(12).u16(nameToType("SRV")).u16(CLASS_IN).u32(300);
+  w.u16(10).u16(1).u16(2).u16(3).bytes([1, 0x78]).u8(0xc0).u8(12);
+  w.u8(0xc0).u8(12).u16(nameToType("NAPTR")).u16(CLASS_IN).u32(300);
+  w.u16(10).u16(1).u16(2).bytes([1, 0x53, 0, 0]).u8(0xc0).u8(12);
+  const p = parseMessage(w.done());
+  eq(
+    "SRV decompressed",
+    rdataToText(p.answers[0].type, p.answers[0].rdata),
+    "1 2 3 x.example.com.",
+  );
+  eq(
+    "NAPTR decompressed",
+    rdataToText(p.answers[1].type, p.answers[1].rdata),
+    '1 2 "S" "" "" example.com.',
+  );
+}
 
 // CNAME parse with relative name
 {

@@ -13,8 +13,13 @@ The browser cannot speak to port 53 directly, so all DNS messages travel through
 a DoWS (DNS over WebSocket) proxy such as
 [dows](https://github.com/famedly/dows).
 
-Editing is supported for A, AAAA, CNAME, TXT and SSHFP records; other record
-types are shown read-only (unknown types as raw RFC 3597 `\# len hex` data).
+Records are shown and edited in their zone file presentation format. This is
+supported for A, AAAA, AFSDB, CAA, CDNSKEY, CDS, CERT, CNAME, DHCID, DNAME,
+DNSKEY, DS, HINFO, HTTPS, KX, MX, NAPTR, NS, NSEC3PARAM, OPENPGPKEY, PTR, RP,
+RT, SMIMEA, SPF, SRV, SSHFP, SVCB, TLSA, TXT, URI and ZONEMD records. SOA records
+are shown read-only, since the server maintains them. Other record types are
+shown read-only as raw RFC 3597 `\# len hex` data. DNSSEC records maintained by
+the signer (RRSIG, NSEC, NSEC3) are hidden.
 
 ## Run
 

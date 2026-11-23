@@ -9,13 +9,37 @@ export const TYPE_NS = 2;
 export const TYPE_CNAME = 5;
 export const TYPE_SOA = 6;
 export const TYPE_PTR = 12;
+export const TYPE_HINFO = 13;
 export const TYPE_MX = 15;
 export const TYPE_TXT = 16;
+export const TYPE_RP = 17;
+export const TYPE_AFSDB = 18;
+export const TYPE_RT = 21;
 export const TYPE_AAAA = 28;
+export const TYPE_SRV = 33;
+export const TYPE_NAPTR = 35;
+export const TYPE_KX = 36;
+export const TYPE_CERT = 37;
+export const TYPE_DNAME = 39;
+export const TYPE_DS = 43;
 export const TYPE_SSHFP = 44;
 export const TYPE_RRSIG = 46;
 export const TYPE_NSEC = 47;
+export const TYPE_DNSKEY = 48;
+export const TYPE_DHCID = 49;
 export const TYPE_NSEC3 = 50;
+export const TYPE_NSEC3PARAM = 51;
+export const TYPE_TLSA = 52;
+export const TYPE_SMIMEA = 53;
+export const TYPE_CDS = 59;
+export const TYPE_CDNSKEY = 60;
+export const TYPE_OPENPGPKEY = 61;
+export const TYPE_ZONEMD = 63;
+export const TYPE_SVCB = 64;
+export const TYPE_HTTPS = 65;
+export const TYPE_SPF = 99;
+export const TYPE_URI = 256;
+export const TYPE_CAA = 257;
 export const TYPE_TSIG = 250;
 export const TYPE_IXFR = 251;
 export const TYPE_AXFR = 252;
@@ -33,25 +57,44 @@ const TYPE_NAMES = {
   5: "CNAME",
   6: "SOA",
   12: "PTR",
+  13: "HINFO",
   15: "MX",
   16: "TXT",
+  17: "RP",
+  18: "AFSDB",
+  21: "RT",
   28: "AAAA",
+  29: "LOC",
   33: "SRV",
   35: "NAPTR",
+  36: "KX",
+  37: "CERT",
+  39: "DNAME",
+  42: "APL",
   43: "DS",
   44: "SSHFP",
+  45: "IPSECKEY",
   46: "RRSIG",
   47: "NSEC",
   48: "DNSKEY",
+  49: "DHCID",
   50: "NSEC3",
   51: "NSEC3PARAM",
   52: "TLSA",
+  53: "SMIMEA",
+  55: "HIP",
   59: "CDS",
   60: "CDNSKEY",
+  61: "OPENPGPKEY",
+  62: "CSYNC",
+  63: "ZONEMD",
   64: "SVCB",
   65: "HTTPS",
   99: "SPF",
+  108: "EUI48",
+  109: "EUI64",
   250: "TSIG",
+  256: "URI",
   257: "CAA",
 };
 
@@ -187,36 +230,46 @@ export function buildQuery(id, qname, qtype, qclass = CLASS_IN) {
   return w.done();
 }
 
+// Layout of the rdata of types that may carry compressed names in received
+// messages (RFC 3597 Section 4): "n" is a domain name, "s" a
+// <character-string>, a number that many fixed-size bytes. Whatever follows
+// the listed fields is copied verbatim.
+const COMPRESSIBLE = {
+  [TYPE_NS]: ["n"],
+  [TYPE_CNAME]: ["n"],
+  [TYPE_SOA]: ["n", "n"],
+  [TYPE_PTR]: ["n"],
+  [TYPE_MX]: [2, "n"],
+  [TYPE_RP]: ["n", "n"],
+  [TYPE_AFSDB]: [2, "n"],
+  [TYPE_RT]: [2, "n"],
+  [TYPE_SRV]: [6, "n"],
+  [TYPE_NAPTR]: [4, "s", "s", "s", "n"],
+};
+
 // Decompress rdata into a self-contained buffer. Types whose rdata may
 // legally contain compressed names get their names expanded so the copy
 // stays valid outside of the original message.
 function extractRdata(msg, type, off, rdlen) {
-  switch (type) {
-    case TYPE_NS:
-    case TYPE_CNAME:
-    case TYPE_PTR: {
-      const [n] = readName(msg, off);
-      return nameToWire(n);
+  const layout = COMPRESSIBLE[type];
+  if (!layout) return msg.slice(off, off + rdlen);
+  const end = off + rdlen;
+  const w = new Writer(rdlen + 32);
+  for (const f of layout) {
+    if (f === "n") {
+      const [n, e] = readName(msg, off);
+      w.name(n);
+      off = e;
+    } else {
+      if (off >= end) throw new Error("truncated rdata");
+      const len = f === "s" ? 1 + msg[off] : f;
+      if (off + len > end) throw new Error("truncated rdata");
+      w.bytes(msg.subarray(off, off + len));
+      off += len;
     }
-    case TYPE_MX: {
-      const w = new Writer(rdlen + 4);
-      w.bytes(msg.subarray(off, off + 2));
-      const [n] = readName(msg, off + 2);
-      return w.name(n).done();
-    }
-    case TYPE_SOA: {
-      const [mname, o1] = readName(msg, off);
-      const [rname, o2] = readName(msg, o1);
-      const w = new Writer(rdlen + 8);
-      return w
-        .name(mname)
-        .name(rname)
-        .bytes(msg.subarray(o2, off + rdlen))
-        .done();
-    }
-    default:
-      return msg.slice(off, off + rdlen);
+    if (off > end) throw new Error("truncated rdata");
   }
+  return w.bytes(msg.subarray(off, end)).done();
 }
 
 export function parseMessage(msg) {
