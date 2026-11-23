@@ -5,7 +5,7 @@
 // admin2136 application glue: login, record list, editing via RFC 2136.
 
 import { DowsConnection } from "./dows.js";
-import { axfr, sendUpdate } from "./dnsops.js";
+import { axfr, query, sendUpdate, DnsError, RCODE_NXRRSET } from "./dnsops.js";
 import { parseTsigSpec } from "./tsig.js";
 import { ZoneStore } from "./zonestore.js";
 import { VirtualList } from "./vlist.js";
@@ -15,7 +15,10 @@ import {
   soaSerial,
   isEditableType,
   typeHint,
-  EDITABLE_TYPES,
+  ADDABLE_TYPES,
+  soaFields,
+  soaRdata,
+  mergeSoa,
 } from "./rdata.js";
 import {
   typeToName,
@@ -392,9 +395,19 @@ $("filter").addEventListener("input", () => {
 
 // ---- editing ----
 
+// The SOA can only be edited in place: it is not offered for adding, and
+// its owner name and type are locked while it is edited.
+const soaOption = document.createElement("option");
+soaOption.textContent = "SOA";
+
 function openEditor(rec) {
   editRec = rec;
   $("edit-status").textContent = "";
+  const isSoa = rec !== null && store.get(rec).type === TYPE_SOA;
+  if (isSoa) $("edit-type").appendChild(soaOption);
+  else soaOption.remove();
+  $("edit-name").disabled = isSoa;
+  $("edit-type").disabled = isSoa;
   if (rec === null) {
     $("edit-title").textContent = "Add record";
     $("edit-name").value = "";
@@ -403,7 +416,7 @@ function openEditor(rec) {
     $("edit-data").value = "";
   } else {
     const r = store.get(rec);
-    $("edit-title").textContent = "Edit record";
+    $("edit-title").textContent = isSoa ? "Edit SOA record" : "Edit record";
     $("edit-name").value = displayName(r.name);
     $("edit-ttl").value = r.ttl;
     $("edit-type").value = typeToName(r.type);
@@ -417,7 +430,7 @@ function updateDataHint() {
   $("edit-data").placeholder = typeHint(nameToType($("edit-type").value));
 }
 
-for (const t of EDITABLE_TYPES) {
+for (const t of ADDABLE_TYPES) {
   const opt = document.createElement("option");
   opt.textContent = typeToName(t);
   $("edit-type").appendChild(opt);
@@ -450,6 +463,23 @@ $("edit-form").addEventListener("submit", async (e) => {
       store.absolutize(n),
     );
     const nameAbs = store.absolutize(nameRel);
+
+    if (type === TYPE_SOA) {
+      status.textContent = "Sending update…";
+      const soa = await updateSoa(editRec, ttl, rdata);
+      $("edit-dialog").close();
+      if (!soa) {
+        setStatus("SOA record unchanged.");
+        return;
+      }
+      store.replace(editRec, "", TYPE_SOA, soa.ttl, soa.rdata);
+      store.serial = soaSerial(soa.rdata);
+      rebuildOrder();
+      applyFilter();
+      updateMeta();
+      setStatus("Updated SOA record (serial " + store.serial + ").", "ok");
+      return;
+    }
 
     const updates = [];
     if (editRec !== null) {
@@ -489,6 +519,67 @@ $("edit-form").addEventListener("submit", async (e) => {
     btn.disabled = false;
   }
 });
+
+const SOA_ATTEMPTS = 5;
+
+// Change the SOA record `rec` to `ttl` and `rdata`, whose serial must be
+// left as is: the serial is incremented here, since servers silently
+// ignore SOA updates that do not increase it. A concurrent update may have
+// increased the serial meanwhile, which would also make this update be
+// ignored silently. Hence the update carries the SOA it is based on as
+// prerequisite (RFC 2136 Section 2.4.2, "RRset exists (value dependent)");
+// if that fails, the current SOA is fetched, the user's changes are merged
+// onto it and the update is retried.
+//
+// Returns the new { ttl, rdata }, or null if nothing was changed.
+async function updateSoa(rec, ttl, rdata) {
+  const old = store.get(rec);
+  const base = soaFields(old.rdata);
+  const edited = soaFields(rdata);
+  if (edited.serial !== base.serial) {
+    throw new Error(
+      "the serial is incremented automatically; leave it at " + base.serial,
+    );
+  }
+  if (ttl === old.ttl && soaRdata(edited).join() === soaRdata(base).join()) {
+    return null;
+  }
+  const apex = store.zoneFqdn;
+  let current = { ttl: old.ttl, rdata: old.rdata.slice() };
+  for (let attempt = 1; ; attempt++) {
+    const next = {
+      ttl: ttl !== old.ttl ? ttl : current.ttl,
+      rdata: soaRdata(mergeSoa(base, edited, soaFields(current.rdata))),
+    };
+    try {
+      await ensureConn();
+      await sendUpdate(
+        conn,
+        apex,
+        tsigKey,
+        [{ name: apex, type: TYPE_SOA, cls: CLASS_IN, ...next }],
+        [
+          {
+            name: apex,
+            type: TYPE_SOA,
+            cls: CLASS_IN,
+            ttl: 0,
+            rdata: current.rdata,
+          },
+        ],
+      );
+      return next;
+    } catch (err) {
+      const raced = err instanceof DnsError && err.rcode === RCODE_NXRRSET;
+      if (!raced || attempt === SOA_ATTEMPTS) throw err;
+      await ensureConn();
+      const answers = await query(conn, apex, TYPE_SOA, tsigKey);
+      const soa = answers.find((rr) => rr.type === TYPE_SOA);
+      if (!soa) throw new Error("the zone has no SOA record");
+      current = { ttl: soa.ttl, rdata: soa.rdata };
+    }
+  }
+}
 
 async function deleteRecord(rec) {
   const r = store.get(rec);

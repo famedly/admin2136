@@ -38,6 +38,8 @@ const RCODES = {
   10: "NOTZONE",
 };
 
+export const RCODE_NXRRSET = 8;
+
 export function rcodeName(rc) {
   return RCODES[rc] || "RCODE" + rc;
 }
@@ -50,11 +52,21 @@ function randId() {
   return crypto.getRandomValues(new Uint16Array(1))[0];
 }
 
-function errorDetail(resp) {
-  const tsig = resp.additional.find((rr) => rr.type === TYPE_TSIG);
-  if (!tsig) return "";
-  const name = tsigErrorName(tsig.rdata);
-  return name ? " (" + name + ")" : "";
+// A DNS error response. `rcode` is the response code, `tsigError` the
+// TSIG error name (e.g. "BADKEY") or null.
+export class DnsError extends Error {
+  constructor(what, resp) {
+    const tsig = resp.additional.find((rr) => rr.type === TYPE_TSIG);
+    const tsigError = tsig ? tsigErrorName(tsig.rdata) : null;
+    super(
+      what +
+        ": " +
+        rcodeName(resp.rcode) +
+        (tsigError ? " (" + tsigError + ")" : ""),
+    );
+    this.rcode = resp.rcode;
+    this.tsigError = tsigError;
+  }
 }
 
 // Stream a full zone transfer; `onRecord` is called for every record of the
@@ -117,9 +129,7 @@ export async function axfr(conn, zone, tsigKey, onRecord) {
       continue;
     }
     if (resp.rcode !== 0) {
-      throw new Error(
-        "AXFR refused: " + rcodeName(resp.rcode) + errorDetail(resp),
-      );
+      throw new DnsError("AXFR refused", resp);
     }
     if (tsig) {
       lastSigned = (await tsig.verify(raw)).signed;
@@ -176,24 +186,26 @@ export async function axfr(conn, zone, tsigKey, onRecord) {
   return count;
 }
 
-// Build an RFC 2136 UPDATE message. `updates` entries:
+// Build an RFC 2136 UPDATE message. `updates` and `prereqs` entries:
 //   { name (absolute), type, cls, ttl, rdata (Uint8Array) }
-export function buildUpdateMessage(id, zone, updates) {
+export function buildUpdateMessage(id, zone, updates, prereqs = []) {
   const w = new Writer(128);
   w.u16(id).u16(OPCODE_UPDATE << 11);
-  w.u16(1).u16(0).u16(updates.length).u16(0);
+  w.u16(1).u16(prereqs.length).u16(updates.length).u16(0);
   w.name(zone).u16(TYPE_SOA).u16(CLASS_IN); // zone section
-  for (const u of updates) {
+  for (const u of [...prereqs, ...updates]) {
     w.name(u.name).u16(u.type).u16(u.cls).u32(u.ttl);
     w.u16(u.rdata.length).bytes(u.rdata);
   }
   return w.done();
 }
 
-export async function sendUpdate(conn, zone, tsigKey, updates) {
+// Send an update and wait for the response. Throws DnsError if the server
+// refuses it or a prerequisite is not met (e.g. RCODE_NXRRSET).
+export async function sendUpdate(conn, zone, tsigKey, updates, prereqs = []) {
   const id = randId();
   const tsig = tsigKey ? new TsigSession(tsigKey) : null;
-  let msg = buildUpdateMessage(id, zone, updates);
+  let msg = buildUpdateMessage(id, zone, updates, prereqs);
   if (tsig) msg = await tsig.sign(msg);
   conn.send(msg);
   for (;;) {
@@ -201,11 +213,26 @@ export async function sendUpdate(conn, zone, tsigKey, updates) {
     const resp = parseMessage(raw);
     if (resp.id !== id) continue;
     if (resp.rcode !== 0) {
-      throw new Error(
-        "update failed: " + rcodeName(resp.rcode) + errorDetail(resp),
-      );
+      throw new DnsError("update failed", resp);
     }
     if (tsig) await tsig.verify(raw);
     return;
+  }
+}
+
+// Query `qname`/`qtype` and return the answer records of the response.
+export async function query(conn, qname, qtype, tsigKey) {
+  const id = randId();
+  const tsig = tsigKey ? new TsigSession(tsigKey) : null;
+  let msg = buildQuery(id, qname, qtype);
+  if (tsig) msg = await tsig.sign(msg);
+  conn.send(msg);
+  for (;;) {
+    const raw = await conn.recv();
+    const resp = parseMessage(raw);
+    if (resp.id !== id) continue;
+    if (resp.rcode !== 0) throw new DnsError("query failed", resp);
+    if (tsig) await tsig.verify(raw);
+    return resp.answers.filter((rr) => rr.type !== TYPE_TSIG);
   }
 }

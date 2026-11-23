@@ -5,7 +5,7 @@
 // Conversion between rdata wire format and presentation text.
 //
 // Every type listed in SCHEMAS below is displayed in its presentation
-// format and can be edited (except SOA, which the server maintains).
+// format and can be edited (the SOA serial is managed by the app).
 // Everything else is shown as RFC 3597 generic data: \# <len> <hex>; that
 // notation is also accepted as input for any type.
 
@@ -140,14 +140,15 @@ const SCHEMAS = {
   },
 };
 
-// Types that can be added and edited, sorted by mnemonic.
-export const EDITABLE_TYPES = Object.keys(SCHEMAS)
+// Types that can be added, sorted by mnemonic. The SOA record exists
+// exactly once per zone: it can be edited, but not added.
+export const ADDABLE_TYPES = Object.keys(SCHEMAS)
   .map(Number)
   .filter((t) => t !== TYPE_SOA)
   .sort((a, b) => (typeToName(a) < typeToName(b) ? -1 : 1));
 
 export function isEditableType(type) {
-  return type !== TYPE_SOA && type in SCHEMAS;
+  return type in SCHEMAS;
 }
 
 // Short description of the presentation format of `type`, for input hints.
@@ -229,6 +230,50 @@ export function soaSerial(rdata) {
       rdata[o2 + 3]) >>>
     0
   );
+}
+
+const SOA_FIELDS = [
+  "mname",
+  "rname",
+  "serial",
+  "refresh",
+  "retry",
+  "expire",
+  "minimum",
+];
+
+// Split SOA rdata into { mname, rname, serial, refresh, ... }.
+export function soaFields(rdata) {
+  const r = new Reader(rdata);
+  const out = {};
+  for (const f of SOA_FIELDS) {
+    out[f] = f.endsWith("name") ? FIELDS.name.read(r) : r.u32();
+  }
+  if (r.o !== rdata.length) throw new Error("malformed SOA rdata");
+  return out;
+}
+
+export function soaRdata(f) {
+  const w = new Writer(64);
+  w.name(f.mname).name(f.rname);
+  for (const k of SOA_FIELDS.slice(2)) w.u32(f[k]);
+  return w.done();
+}
+
+// Three-way merge of an SOA edit: apply the fields that changed from
+// `base` (the SOA the edit started from) to `edited` onto `current` (the
+// SOA now in the zone, which a concurrent update may have changed), and
+// increment the serial of `current` (RFC 1982 arithmetic). Servers ignore
+// SOA updates that do not increase the serial (RFC 2136 Section 3.4.2.2).
+export function mergeSoa(base, edited, current) {
+  const same = (k) =>
+    k.endsWith("name")
+      ? base[k].toLowerCase() === edited[k].toLowerCase()
+      : base[k] === edited[k];
+  const out = {};
+  for (const k of SOA_FIELDS) out[k] = same(k) ? current[k] : edited[k];
+  out.serial = (current.serial + 1) >>> 0;
+  return out;
 }
 
 // ---- field codecs ----

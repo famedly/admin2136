@@ -16,10 +16,12 @@ a DoWS (DNS over WebSocket) proxy such as
 Records are shown and edited in their zone file presentation format. This is
 supported for A, AAAA, AFSDB, CAA, CDNSKEY, CDS, CERT, CNAME, DHCID, DNAME,
 DNSKEY, DS, HINFO, HTTPS, KX, MX, NAPTR, NS, NSEC3PARAM, OPENPGPKEY, PTR, RP,
-RT, SMIMEA, SPF, SRV, SSHFP, SVCB, TLSA, TXT, URI and ZONEMD records. SOA records
-are shown read-only, since the server maintains them. Other record types are
-shown read-only as raw RFC 3597 `\# len hex` data. DNSSEC records maintained by
-the signer (RRSIG, NSEC, NSEC3) are hidden.
+RT, SMIMEA, SPF, SRV, SSHFP, SVCB, TLSA, TXT, URI and ZONEMD records. The SOA
+record can be edited as well, except for its serial, which is incremented
+automatically; concurrent updates of the SOA are detected with an RFC 2136
+prerequisite and merged. Other record types are shown read-only as raw RFC 3597
+`\# len hex` data. DNSSEC records maintained by the signer (RRSIG, NSEC, NSEC3)
+are hidden.
 
 ## Run
 

@@ -39,7 +39,10 @@ import {
   soaSerial,
   isEditableType,
   typeHint,
-  EDITABLE_TYPES,
+  ADDABLE_TYPES,
+  soaFields,
+  soaRdata,
+  mergeSoa,
 } from "../js/rdata.js";
 
 let failures = 0;
@@ -229,7 +232,7 @@ check(
   ];
   for (const [t, text] of cases) {
     const type = nameToType(t);
-    check(t + " is editable", EDITABLE_TYPES.includes(type));
+    check(t + " can be added", ADDABLE_TYPES.includes(type));
     let got;
     try {
       got = rdataToText(type, textToRdata(type, text, abs));
@@ -282,8 +285,8 @@ check(
     ),
     "3 1 1 abcd",
   );
-  eq("SOA is read-only", isEditableType(TYPE_SOA), false);
-  check("SOA is not offered", !EDITABLE_TYPES.includes(TYPE_SOA));
+  eq("SOA is editable", isEditableType(TYPE_SOA), true);
+  check("SOA cannot be added", !ADDABLE_TYPES.includes(TYPE_SOA));
   check("unknown type is read-only", !isEditableType(999));
   check("CAA hint", typeHint(nameToType("CAA")).includes("issue"));
 
@@ -381,6 +384,39 @@ check(
     "soa text contains serial",
     rdataToText(TYPE_SOA, soa).includes("2024011501"),
   );
+  eq("soa fields roundtrip", hex(soaRdata(soaFields(soa))), hex(soa));
+
+  // Three-way merge: the user changed rname and minimum starting from
+  // `base`; meanwhile another update raised the serial and changed retry.
+  const f = (text) => soaFields(textToRdata(TYPE_SOA, text));
+  const base = f(
+    "ns1.example.com. hostmaster.example.com. 5 7200 3600 1209600 300",
+  );
+  const edited = f(
+    "ns1.example.com. admin.example.com. 5 7200 3600 1209600 60",
+  );
+  const current = f(
+    "ns1.example.com. hostmaster.example.com. 9 7200 900 1209600 300",
+  );
+  eq(
+    "soa merge",
+    rdataToText(TYPE_SOA, soaRdata(mergeSoa(base, edited, current))),
+    "ns1.example.com. admin.example.com. 10 7200 900 1209600 60",
+  );
+  eq(
+    "soa merge ignores name case",
+    mergeSoa(
+      base,
+      f("NS1.example.com. hostmaster.example.com. 5 7200 3600 1209600 300"),
+      current,
+    ).mname,
+    "ns1.example.com.",
+  );
+  eq(
+    "soa serial wraps (RFC 1982)",
+    mergeSoa(base, edited, { ...current, serial: 0xffffffff }).serial,
+    0,
+  );
 }
 
 // --- zone store ---
@@ -446,6 +482,27 @@ check(
   eq("update count", p.authority.length, 2);
   eq("update delete class", p.authority[0].cls, CLASS_NONE);
   eq("update add class", p.authority[1].cls, CLASS_IN);
+
+  // prerequisites go into the answer section slot, before the updates
+  const rr = (cls, ttl) => ({
+    name: "example.com.",
+    type: TYPE_SOA,
+    cls,
+    ttl,
+    rdata: Uint8Array.of(0, 0, ...new Array(20).fill(0)),
+  });
+  const q = parseMessage(
+    buildUpdateMessage(
+      8,
+      "example.com.",
+      [rr(CLASS_IN, 300)],
+      [rr(CLASS_IN, 0)],
+    ),
+  );
+  eq("update prereq count", q.answers.length, 1);
+  eq("update prereq ttl", q.answers[0].ttl, 0);
+  eq("update count with prereq", q.authority.length, 1);
+  eq("update ttl with prereq", q.authority[0].ttl, 300);
 }
 
 // --- TSIG signing ---
