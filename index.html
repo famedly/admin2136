@@ -107,6 +107,21 @@ SPDX-License-Identifier: AGPL-3.0-or-later
   </form>
 </dialog>
 
+<dialog id="key-dialog">
+  <form id="key-form" autocomplete="off">
+    <h2 id="key-title">TSIG key</h2>
+    <p id="key-message"></p>
+    <label>TSIG secret
+      <input id="key-input" type="password" spellcheck="false" placeholder="hmac-sha256:keyname:base64secret">
+    </label>
+    <div class="dialog-buttons">
+      <button type="button" id="key-cancel">Cancel</button>
+      <button type="submit" id="key-submit">Retry</button>
+    </div>
+    <div id="key-status" class="status" role="status"></div>
+  </form>
+</dialog>
+
 <dialog id="about-dialog">
   <h2>admin2136</h2>
   <p>A web frontend for DNS zone management via AXFR and RFC&nbsp;2136

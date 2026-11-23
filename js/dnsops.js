@@ -38,7 +38,10 @@ const RCODES = {
   10: "NOTZONE",
 };
 
+export const RCODE_SERVFAIL = 2;
+const RCODE_REFUSED = 5;
 export const RCODE_NXRRSET = 8;
+const RCODE_NOTAUTH = 9;
 
 export function rcodeName(rc) {
   return RCODES[rc] || "RCODE" + rc;
@@ -67,6 +70,20 @@ export class DnsError extends Error {
     this.rcode = resp.rcode;
     this.tsigError = tsigError;
   }
+}
+
+// Whether `err` is a refusal by the server that a different TSIG key might
+// overcome (as opposed to e.g. a failed update prerequisite). SERVFAIL is
+// a server-side failure (e.g. a zone without contents) whatever else the
+// response says, so never a rejection.
+export function isRejection(err) {
+  return (
+    err instanceof DnsError &&
+    err.rcode !== RCODE_SERVFAIL &&
+    (err.rcode === RCODE_REFUSED ||
+      err.rcode === RCODE_NOTAUTH ||
+      err.tsigError !== null)
+  );
 }
 
 // Stream a full zone transfer; `onRecord` is called for every record of the

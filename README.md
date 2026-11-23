@@ -28,6 +28,12 @@ member zones, which can be filtered, opened, added and removed. A toggle in the
 toolbar switches to the raw records of the catalog zone. Each opened member zone
 gets its own browser history entry, so the back button returns to the catalog.
 
+The TSIG key given at login is used for all zone transfers and updates. If the
+server rejects an update (for example because the key only grants transfers), a
+separate key for updates of that zone can be entered. Likewise, if the server
+refuses the transfer of a member zone opened from a catalog with the catalog's
+key, another key for that zone can be entered.
+
 ## Run
 
 The site is fully static and can be served by any web server. A Docker image

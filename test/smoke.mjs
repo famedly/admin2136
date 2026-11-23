@@ -25,7 +25,12 @@ import {
   CLASS_NONE,
 } from "../js/dnswire.js";
 import { parseTsigSpec, signMessage, TsigSession } from "../js/tsig.js";
-import { buildUpdateMessage, IGNORED_RRTYPES } from "../js/dnsops.js";
+import {
+  buildUpdateMessage,
+  IGNORED_RRTYPES,
+  DnsError,
+  isRejection,
+} from "../js/dnsops.js";
 import { ZoneStore } from "../js/zonestore.js";
 import {
   parseCatalog,
@@ -769,6 +774,42 @@ check(
     "a.www/A/300",
     "b.www/A/300",
   ]);
+}
+
+// --- DNS error responses ---
+{
+  const resp = (rcode, tsigError = 0) => {
+    const w = new Writer();
+    w.bytes(buildQuery(9, "example.com.", TYPE_SOA));
+    if (tsigError) {
+      const rd = new Writer();
+      rd.name("hmac-sha256.").u48(0).u16(300).u16(0); // no MAC
+      rd.u16(9).u16(tsigError).u16(0);
+      const rdata = rd.done();
+      w.name("key.").u16(TYPE_TSIG).u16(CLASS_ANY).u32(0);
+      w.u16(rdata.length).bytes(rdata);
+    }
+    const m = w.done();
+    m[3] = rcode;
+    if (tsigError) m[11] = 1; // ARCOUNT
+    return parseMessage(m);
+  };
+  const refused = new DnsError("update failed", resp(5));
+  eq("DnsError message", refused.message, "update failed: REFUSED");
+  check("REFUSED is a rejection", isRejection(refused));
+  const badkey = new DnsError("AXFR refused", resp(9, 17));
+  eq("DnsError TSIG message", badkey.message, "AXFR refused: NOTAUTH (BADKEY)");
+  eq("DnsError TSIG error", badkey.tsigError, "BADKEY");
+  check("NOTAUTH is a rejection", isRejection(badkey));
+  check(
+    "YXRRSET is no rejection",
+    !isRejection(new DnsError("update failed", resp(7))),
+  );
+  check("plain error is no rejection", !isRejection(new Error("timeout")));
+  check(
+    "SERVFAIL is no rejection, even with a TSIG error",
+    !isRejection(new DnsError("AXFR refused", resp(2, 16))),
+  );
 }
 
 // --- catalog zones (RFC 9432) ---

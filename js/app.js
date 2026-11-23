@@ -6,7 +6,14 @@
 // catalog zone browsing.
 
 import { DowsConnection } from "./dows.js";
-import { axfr, query, sendUpdate, DnsError, RCODE_NXRRSET } from "./dnsops.js";
+import {
+  axfr,
+  query,
+  sendUpdate,
+  isRejection,
+  DnsError,
+  RCODE_NXRRSET,
+} from "./dnsops.js";
 import { parseTsigSpec } from "./tsig.js";
 import { ZoneStore } from "./zonestore.js";
 import { VirtualList } from "./vlist.js";
@@ -60,6 +67,7 @@ function newSession(zone, tsigKey, depth) {
     depth,
     store: new ZoneStore(zone),
     tsigKey, // parsed TSIG key or null
+    updateKey: undefined, // separate key for updates; undefined = tsigKey
     order: new Uint32Array(0), // display order -> arena record index
     view: null, // null = show all of `order`, else filtered record indices
     catalog: null, // parseCatalog() result, null if not a catalog zone
@@ -139,6 +147,126 @@ function runOn(c, fn) {
 
 async function withConn(fn) {
   return runOn(await getConn(), fn);
+}
+
+// ---- TSIG keys ----
+
+// Parse a "hmac-sha256:keyname:base64secret" input; empty means no key.
+function parseKeyInput(spec) {
+  spec = spec.trim();
+  if (!spec) return null;
+  if (!(crypto && crypto.subtle)) {
+    throw new Error(
+      "Web Crypto unavailable; serve this page via https:// or from localhost",
+    );
+  }
+  return parseTsigSpec(spec);
+}
+
+let keyPrompt = null; // { attempt, resolve } of the open key dialog
+let keyTrying = false; // an attempt of the key dialog is in flight
+
+// Ask for a TSIG key and call `attempt(key)` with it until that succeeds
+// (resolves true) or the user gives up (resolves false). Errors thrown by
+// `attempt` are shown in the dialog, which stays open for another try.
+function askKey({ title, message, submit, attempt }) {
+  if (keyPrompt) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    keyPrompt = { attempt, resolve };
+    $("key-title").textContent = title;
+    $("key-message").textContent = message;
+    $("key-submit").textContent = submit;
+    $("key-input").value = "";
+    $("key-status").textContent = "";
+    $("key-dialog").showModal();
+  });
+}
+
+// Close the key dialog and settle its prompt.
+function endKeyPrompt(ok) {
+  const prompt = keyPrompt;
+  keyPrompt = null;
+  if ($("key-dialog").open) $("key-dialog").close();
+  if (prompt) prompt.resolve(ok);
+}
+
+$("key-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const status = $("key-status");
+  try {
+    keyTrying = true;
+    $("key-submit").disabled = true;
+    $("key-cancel").disabled = true;
+    const key = parseKeyInput($("key-input").value);
+    status.textContent = "Trying…";
+    await keyPrompt.attempt(key);
+    endKeyPrompt(true);
+  } catch (err) {
+    status.textContent = "✗ " + err.message;
+  } finally {
+    keyTrying = false;
+    $("key-submit").disabled = false;
+    $("key-cancel").disabled = false;
+  }
+});
+
+$("key-cancel").addEventListener("click", () => endKeyPrompt(false));
+
+// Escape gives up as well, but not while an attempt is in flight: its
+// outcome is still to be reported to the caller.
+$("key-dialog").addEventListener("cancel", (e) => {
+  e.preventDefault();
+  if (!keyTrying) endKeyPrompt(false);
+});
+
+// Closed by history navigation (which closes all dialogs): give up. The
+// event is dispatched asynchronously, so the dialog may already have been
+// reopened for another prompt by now; that one must not be affected.
+$("key-dialog").addEventListener("close", () => {
+  if (!$("key-dialog").open) endKeyPrompt(false);
+});
+
+function updateKeyOf(s) {
+  return s.updateKey !== undefined ? s.updateKey : s.tsigKey;
+}
+
+// Send an RFC 2136 update for the zone of session `s`. If the server
+// rejects it (the key used for the transfer may lack update permission),
+// offer to enter a separate TSIG key for updates of this zone; on success
+// that key is used for all further updates of the zone.
+async function performUpdate(s, updates, prereqs = []) {
+  const zone = s.store.zoneFqdn;
+  const send = (key) =>
+    withConn((c) => sendUpdate(c, zone, key, updates, prereqs));
+  try {
+    await send(updateKeyOf(s));
+  } catch (err) {
+    if (!isRejection(err)) throw err;
+    // An error that is not a rejection means the key was accepted; it
+    // ends the prompt and is reported like any other update failure.
+    let failure = null;
+    const ok = await askKey({
+      title: "Update rejected",
+      message:
+        "The server rejected the update of " +
+        zone +
+        " (" +
+        err.message +
+        "). Enter a TSIG key for updates of this zone to retry.",
+      submit: "Retry update",
+      attempt: async (key) => {
+        try {
+          await send(key);
+        } catch (e) {
+          if (isRejection(e)) throw e;
+          failure = e;
+        }
+        s.updateKey = key;
+      },
+    });
+    if (!ok) throw err;
+    if (failure) throw failure;
+  }
 }
 
 // ---- loading ----
@@ -426,26 +554,45 @@ $("raw-btn").addEventListener("click", () => {
 
 // Open a member zone of the current (catalog) session in a new session.
 // The view switches once the zone transfer got going; until then the
-// catalog stays visible.
+// catalog stays visible. The member zone is first tried with the
+// catalog's transfer key; if the server refuses the transfer, the user may
+// enter another one. Other failures (e.g. no connection) do not depend on
+// the key and are only reported.
 async function openMember(m) {
   const parent = cur;
   if (parent.opening) return;
   parent.opening = true;
   const s = newSession(m.zone, parent.tsigKey, parent.depth + 1);
+  const onStarted = () => {
+    // Do not navigate away if the user left the catalog meanwhile.
+    if (cur !== parent || $("zone-view").hidden) return;
+    setStatus(parent, "");
+    enterSession(s);
+  };
   setStatus(parent, "Opening " + m.zone + "…");
   try {
-    await startLoad(s, () => {
-      // Do not navigate away if the user left the catalog meanwhile.
-      if (cur !== parent || $("zone-view").hidden) return;
-      setStatus(parent, "");
-      enterSession(s);
-    });
+    await startLoad(s, onStarted);
   } catch (err) {
     setStatus(
       parent,
       "✗ opening " + m.zone + " failed: " + err.message,
       "error",
     );
+    if (!isRejection(err)) return;
+    await askKey({
+      title: "Transfer refused",
+      message:
+        "The server refused the transfer of " +
+        m.zone +
+        " (" +
+        err.message +
+        "). Enter a TSIG key for this zone to retry.",
+      submit: "Open zone",
+      attempt: async (key) => {
+        s.tsigKey = key;
+        await startLoad(s, onStarted);
+      },
+    });
   } finally {
     parent.opening = false;
   }
@@ -457,7 +604,7 @@ async function deleteMember(m) {
   try {
     setStatus(s, "Removing " + m.zone + "…");
     const updates = deleteMemberUpdates(s.store, m);
-    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    await performUpdate(s, updates);
     // Remove from the highest index down, since removal shifts the
     // indices of all later records.
     for (const i of [...m.recs].sort((a, b) => b - a)) s.store.remove(i);
@@ -497,7 +644,7 @@ $("zone-form").addEventListener("submit", async (e) => {
     const updates = addUpdates(s.store, recs);
 
     status.textContent = "Sending update…";
-    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    await performUpdate(s, updates);
     for (const r of recs) s.store.add(r.name, r.type, r.ttl, r.rdata);
 
     $("zone-dialog").close();
@@ -558,7 +705,6 @@ $("login-form").addEventListener("submit", async (e) => {
   const proxy = $("proxy-url").value.trim();
   const ns = $("nameserver").value.trim();
   const zone = $("zone").value.trim().toLowerCase().replace(/\.$/, "");
-  const tsigSpec = $("tsig").value.trim();
 
   // A fresh connection; the sessions of a previous login (still reachable
   // via the forward button) keep theirs until this login succeeded.
@@ -566,12 +712,7 @@ $("login-form").addEventListener("submit", async (e) => {
   try {
     btn.disabled = true;
     status.textContent = "";
-    if (tsigSpec && !(crypto && crypto.subtle)) {
-      throw new Error(
-        "Web Crypto unavailable; serve this page via https:// or from localhost",
-      );
-    }
-    const tsigKey = tsigSpec ? parseTsigSpec(tsigSpec) : null;
+    const tsigKey = parseKeyInput($("tsig").value);
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({ proxy, ns, zone }));
 
     status.textContent = "Connecting to " + ns + "…";
@@ -801,7 +942,7 @@ $("edit-form").addEventListener("submit", async (e) => {
     updates.push({ name: nameAbs, type, cls: CLASS_IN, ttl, rdata });
 
     status.textContent = "Sending update…";
-    await withConn((c) => sendUpdate(c, store.zoneFqdn, s.tsigKey, updates));
+    await performUpdate(s, updates);
 
     if (editRec !== null) store.replace(editRec, nameRel, type, ttl, rdata);
     else store.add(nameRel, type, ttl, rdata);
@@ -866,7 +1007,7 @@ async function updateSoa(s, rec, ttl, rdata) {
       },
     ];
     try {
-      await withConn((c) => sendUpdate(c, apex, s.tsigKey, updates, prereqs));
+      await performUpdate(s, updates, prereqs);
       return next;
     } catch (err) {
       const raced = err instanceof DnsError && err.rcode === RCODE_NXRRSET;
@@ -900,7 +1041,7 @@ async function deleteRecord(rec) {
         rdata: r.rdata,
       },
     ];
-    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    await performUpdate(s, updates);
     s.store.remove(rec);
     rebuild(s);
     setStatus(s, "Deleted " + what + " record.", "ok");

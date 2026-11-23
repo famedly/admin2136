@@ -406,3 +406,8 @@ dialog textarea {
     justify-content: flex-end;
     margin-top: 6px;
 }
+#key-message {
+    margin: 0 0 16px;
+    color: var(--fg-dim);
+    overflow-wrap: anywhere;
+}
