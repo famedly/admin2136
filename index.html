@@ -25,6 +25,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
     <span id="zone-meta"></span>
   </div>
   <input id="filter" class="zone-only" type="search" placeholder="Filter records…" spellcheck="false">
+  <button id="raw-btn" class="zone-only" aria-pressed="false" hidden title="Show the raw records of the catalog zone instead of its member zones">Raw records</button>
   <button id="add-btn" class="zone-only">+ Add record</button>
   <button id="refresh-btn" class="zone-only" title="Reload the zone via AXFR (IXFR planned)">⟳ Refresh</button>
   <button id="about-btn" title="About admin2136">About</button>
@@ -57,6 +58,10 @@ SPDX-License-Identifier: AGPL-3.0-or-later
     <span>Name</span><span>TTL</span><span>Type</span><span>Data</span><span></span>
   </div>
   <div id="record-list"></div>
+  <div id="zone-header" class="zone-grid">
+    <span>Zone</span><span>Group</span><span>ID</span><span></span>
+  </div>
+  <div id="zone-list"></div>
   <footer id="status-bar" role="status"></footer>
 </section>
 
@@ -82,6 +87,23 @@ SPDX-License-Identifier: AGPL-3.0-or-later
       <button type="submit" id="edit-save">Save</button>
     </div>
     <div id="edit-status" class="status" role="status"></div>
+  </form>
+</dialog>
+
+<dialog id="zone-dialog">
+  <form id="zone-form" autocomplete="off">
+    <h2>Add zone to catalog</h2>
+    <label>Zone
+      <input id="zone-new-name" required spellcheck="false" placeholder="example.com">
+    </label>
+    <label>Group (optional)
+      <input id="zone-new-group" spellcheck="false">
+    </label>
+    <div class="dialog-buttons">
+      <button type="button" id="zone-cancel">Cancel</button>
+      <button type="submit" id="zone-save">Add</button>
+    </div>
+    <div id="zone-status" class="status" role="status"></div>
   </form>
 </dialog>
 

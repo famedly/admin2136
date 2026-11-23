@@ -23,6 +23,11 @@ prerequisite and merged. Other record types are shown read-only as raw RFC 3597
 `\# len hex` data. DNSSEC records maintained by the signer (RRSIG, NSEC, NSEC3)
 are hidden.
 
+Catalog zones (RFC 9432) are detected automatically and shown as a list of their
+member zones, which can be filtered, opened, added and removed. A toggle in the
+toolbar switches to the raw records of the catalog zone. Each opened member zone
+gets its own browser history entry, so the back button returns to the catalog.
+
 ## Run
 
 The site is fully static and can be served by any web server. A Docker image

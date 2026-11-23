@@ -28,6 +28,13 @@ import { parseTsigSpec, signMessage, TsigSession } from "../js/tsig.js";
 import { buildUpdateMessage, IGNORED_RRTYPES } from "../js/dnsops.js";
 import { ZoneStore } from "../js/zonestore.js";
 import {
+  parseCatalog,
+  newMemberId,
+  memberRecords,
+  addUpdates,
+  deleteMemberUpdates,
+} from "../js/catalog.js";
+import {
   rdataToText,
   textToRdata,
   parseIpv4,
@@ -762,6 +769,83 @@ check(
     "a.www/A/300",
     "b.www/A/300",
   ]);
+}
+
+// --- catalog zones (RFC 9432) ---
+{
+  const ptr = (n) => nameToWire(n);
+  const mkCatalog = () => {
+    const st = new ZoneStore("catalog.invalid");
+    st.add("", TYPE_SOA, 0, Uint8Array.of(0, 0, ...new Array(20).fill(0)));
+    st.add("", nameToType("NS"), 0, nameToWire("invalid."));
+    st.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+    st.add("b1.zones", nameToType("PTR"), 0, ptr("b.example."));
+    st.add("group.b1.zones", TYPE_TXT, 0, parseTxt('"web"'));
+    st.add("A2.zones", nameToType("PTR"), 0, ptr("a.example."));
+    st.add("ext", TYPE_TXT, 0, parseTxt('"custom"'));
+    st.add("nozone.zones", TYPE_TXT, 0, parseTxt('"orphan property"'));
+    return st;
+  };
+
+  const st = mkCatalog();
+  eq("findName", st.findName("VERSION"), [2]);
+  const cat = parseCatalog(st);
+  check("catalog detected", cat !== null);
+  eq("catalog version", cat.version, "2");
+  eq(
+    "catalog members",
+    cat.members.map((m) => [m.zone, m.id, m.group, m.recs]),
+    [
+      ["a.example.", "A2", null, [5]],
+      ["b.example.", "b1", "web", [3, 4]],
+    ],
+  );
+
+  const plain = new ZoneStore("example.com");
+  plain.add("www", TYPE_A, 300, Uint8Array.of(192, 0, 2, 1));
+  eq("plain zone is no catalog", parseCatalog(plain), null);
+  plain.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+  eq(
+    "version alone with other records is no catalog",
+    parseCatalog(plain),
+    null,
+  );
+  plain.add("x.zones", nameToType("PTR"), 0, ptr("member.example."));
+  eq(
+    "mixed zone with members is a catalog",
+    parseCatalog(plain)?.members.length,
+    1,
+  );
+
+  const empty = new ZoneStore("catalog.invalid");
+  empty.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+  eq("empty catalog", parseCatalog(empty)?.members, []);
+  empty.replace(0, "version", TYPE_TXT, 0, parseTxt('"3"'));
+  eq("unknown catalog version", parseCatalog(empty), null);
+
+  const id = newMemberId(cat);
+  check("member id is a hex label", /^[0-9a-f]{16}$/.test(id));
+  const recs = memberRecords("c.example", id, "mail");
+  eq(
+    "member records",
+    recs.map((r) => [r.name, typeToName(r.type), rdataToText(r.type, r.rdata)]),
+    [
+      [id + ".zones", "PTR", "c.example."],
+      ["group." + id + ".zones", "TXT", '"mail"'],
+    ],
+  );
+  const add = addUpdates(st, recs);
+  eq("add update name", add[0].name, id + ".zones.catalog.invalid.");
+  eq("add update class", add[0].cls, CLASS_IN);
+  const del = deleteMemberUpdates(st, cat.members[1]);
+  eq(
+    "delete member updates",
+    del.map((u) => [u.name, typeToName(u.type), u.cls]),
+    [
+      ["b1.zones.catalog.invalid.", "PTR", CLASS_NONE],
+      ["group.b1.zones.catalog.invalid.", "TXT", CLASS_NONE],
+    ],
+  );
 }
 
 if (failures) {

@@ -189,6 +189,23 @@ export class ZoneStore {
     return ttlA - ttlB;
   }
 
+  // Indices of all records owned by the relative name `rel` (compared
+  // case-insensitively). Scans the arena bytes without decoding, so it is
+  // cheap enough to run after every store mutation.
+  findName(rel) {
+    const want = te.encode(rel.toLowerCase());
+    const a = this.arena;
+    const out = [];
+    for (let i = 0; i < this.count; i++) {
+      const o = this.offsets[i];
+      if (a[o] !== want.length) continue;
+      let j = 0;
+      while (j < want.length && lowerByte(a[o + 1 + j]) === want[j]) j++;
+      if (j === want.length) out.push(i);
+    }
+    return out;
+  }
+
   // Decode record i. `rdata` is a view into the arena: valid until the store
   // is cleared, but stays intact across add/replace/remove.
   get(i) {

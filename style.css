@@ -244,7 +244,28 @@ a {
     padding: 0 14px;
 }
 
-#list-header {
+/* Catalog zones list their member zones instead of the records. */
+.zone-grid {
+    display: grid;
+    grid-template-columns: minmax(200px, 3fr) 1fr 1fr 76px;
+    gap: 10px;
+    align-items: center;
+    padding: 0 14px;
+}
+#zone-view.catalog-mode #list-header,
+#zone-view.catalog-mode #record-list,
+#zone-view:not(.catalog-mode) #zone-header,
+#zone-view:not(.catalog-mode) #zone-list {
+    display: none;
+}
+
+#raw-btn[aria-pressed="true"] {
+    background: var(--bg-hover);
+    border-color: var(--accent);
+}
+
+#list-header,
+#zone-header {
     height: 30px;
     font-size: 11px;
     text-transform: uppercase;
@@ -254,7 +275,8 @@ a {
     background: var(--bg-alt);
 }
 
-#record-list {
+#record-list,
+#zone-list {
     flex: 1;
     overflow-y: auto;
     position: relative;
@@ -291,6 +313,26 @@ a {
 }
 .vlist-row.readonly .c-type {
     color: var(--fg-dim);
+}
+.vlist-row .c-group,
+.vlist-row .c-id {
+    color: var(--fg-dim);
+}
+/* The member zone name is a link-like button opening the zone. */
+.vlist-row .c-zone {
+    padding: 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    text-align: left;
+    font: inherit;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.vlist-row .c-zone:hover {
+    background: none;
+    text-decoration: underline;
 }
 .vlist-row .c-actions {
     display: flex;

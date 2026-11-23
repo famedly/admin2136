@@ -2,7 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// admin2136 application glue: login, record list, editing via RFC 2136.
+// admin2136 application glue: login, record list, editing via RFC 2136,
+// catalog zone browsing.
 
 import { DowsConnection } from "./dows.js";
 import { axfr, query, sendUpdate, DnsError, RCODE_NXRRSET } from "./dnsops.js";
@@ -21,6 +22,14 @@ import {
   mergeSoa,
 } from "./rdata.js";
 import {
+  parseCatalog,
+  newMemberId,
+  memberRecords,
+  addUpdates,
+  deleteMemberUpdates,
+} from "./catalog.js";
+import {
+  nameToWire,
   typeToName,
   nameToType,
   TYPE_SOA,
@@ -33,18 +42,44 @@ const $ = (id) => document.getElementById(id);
 const ROW_HEIGHT = 30;
 const SETTINGS_KEY = "admin2136-settings";
 
-let conn = null; // DowsConnection
-let store = null; // ZoneStore
-let tsigKey = null; // parsed TSIG key or null
-let order = new Uint32Array(0); // display order -> arena record index
-let view = null; // null = show all of `order`, else filtered record indices
-let vlist = null; // VirtualList
-let editRec = null; // record index being edited, or null for "add"
+let conn = null; // DowsConnection shared by all zone sessions
+let connecting = null; // pending reconnect, see getConn()
 let settings = { proxy: "", ns: "" };
+let vlist = null; // VirtualList of records
+let zlist = null; // VirtualList of catalog member zones
+let editRec = null; // record index being edited, or null for "add"
+
+// One session per opened zone. The zone opened at login has depth 0, a
+// zone opened from a catalog one more than the catalog. A session's depth
+// is also its index in `sessions` and identifies its history entry.
+let sessions = [];
+let cur = null; // session shown in the zone view
+
+function newSession(zone, tsigKey, depth) {
+  return {
+    depth,
+    store: new ZoneStore(zone),
+    tsigKey, // parsed TSIG key or null
+    order: new Uint32Array(0), // display order -> arena record index
+    view: null, // null = show all of `order`, else filtered record indices
+    catalog: null, // parseCatalog() result, null if not a catalog zone
+    zoneView: [], // catalog members matching the filter
+    showRaw: false, // show raw records instead of the catalog's zones
+    filter: "",
+    loadingSerial: null, // serial shown while the initial load runs
+    opening: false, // a member zone is being opened from this catalog
+    status: { text: "", cls: "" },
+    scroll: { records: 0, zones: 0 },
+  };
+}
 
 // ---- helpers ----
 
-function setStatus(text, cls = "") {
+// Set the status bar text of session `s`; shown right away if `s` is the
+// current session, otherwise when it is navigated to.
+function setStatus(s, text, cls = "") {
+  s.status = { text, cls };
+  if (s !== cur) return;
   const el = $("status-bar");
   el.textContent = text;
   el.className = cls;
@@ -52,6 +87,10 @@ function setStatus(text, cls = "") {
 
 function displayName(rel) {
   return rel === "" ? "@" : rel;
+}
+
+function showsZones(s) {
+  return s.catalog !== null && !s.showRaw;
 }
 
 // Map a DoWS proxy WebSocket URL to the corresponding HTTP(S) URL where the
@@ -69,48 +108,220 @@ function proxyHttpUrl(wsUrl) {
   return u.href;
 }
 
+// ---- connection ----
+
+// The shared connection, reconnecting if it was closed in the meantime.
+function getConn() {
+  if (conn && conn.connected) return Promise.resolve(conn);
+  if (!connecting) {
+    const c = new DowsConnection(settings.proxy, settings.ns);
+    connecting = c
+      .connect()
+      .then(() => {
+        conn = c;
+        return c;
+      })
+      .finally(() => {
+        connecting = null;
+      });
+  }
+  return connecting;
+}
+
+// Run `fn(c)` on connection `c` once all operations queued on it before
+// have finished. Responses are matched to requests by reading the next
+// messages from the connection, so two operations must never overlap.
+function runOn(c, fn) {
+  const p = (c.opQueue ?? Promise.resolve()).then(() => fn(c));
+  c.opQueue = p.catch(() => {});
+  return p;
+}
+
+async function withConn(fn) {
+  return runOn(await getConn(), fn);
+}
+
+// ---- loading ----
+
+// Transfer the zone of session `s` into a fresh store; the session's store
+// is only replaced on success so a failed reload does not lose the working
+// copy. Uses connection `c` if given, else the shared one.
+async function transferZone(s, progress, c = null) {
+  const fresh = new ZoneStore(s.store.zone);
+  let n = 0;
+  const run = (c) =>
+    axfr(c, fresh.zoneFqdn, s.tsigKey, (rr) => {
+      fresh.add(fresh.relativize(rr.name), rr.type, rr.ttl, rr.rdata);
+      if (rr.type === TYPE_SOA) fresh.serial = soaSerial(rr.rdata);
+      // Report the very first record immediately (it signals that the
+      // server accepted the request), then every 1024 records. The serial
+      // is known from the first record on, since an AXFR starts with the
+      // SOA.
+      if (++n === 1 || (n & 1023) === 0) progress(n, fresh.serial);
+    });
+  await (c ? runOn(c, run) : withConn(run));
+  s.store = fresh;
+}
+
+// Start the initial load of session `s`. The returned promise resolves as
+// soon as the first record arrived, right after `onStarted()` was called
+// (which typically switches to the zone view), and rejects if the transfer
+// fails before that. Later failures and the completion are reported in the
+// session's status bar.
+function startLoad(s, onStarted, c = null) {
+  return new Promise((resolve, reject) => {
+    let started = false;
+    const start = () => {
+      if (started) return;
+      started = true;
+      onStarted();
+      resolve();
+    };
+    transferZone(
+      s,
+      (n, serial) => {
+        s.loadingSerial = serial;
+        start();
+        if (s === cur) updateMeta();
+        setStatus(s, "Transferring zone… " + n + " records");
+      },
+      c,
+    ).then(
+      () => {
+        start();
+        s.loadingSerial = null;
+        rebuild(s);
+        setStatus(
+          s,
+          "Zone loaded via AXFR (" + s.store.count + " records).",
+          "ok",
+        );
+      },
+      (err) => {
+        if (!started) {
+          reject(err);
+          return;
+        }
+        s.loadingSerial = null;
+        setStatus(s, "✗ zone transfer failed: " + err.message, "error");
+      },
+    );
+  });
+}
+
+// ---- views ----
+
 // Rebuild the indirection array used for display: it starts as the identity
 // sequence 0..n over the arena records and is sorted with the store's
 // comparator (revname, type, ttl). Rows never move in the arena; only this
 // array determines what the list shows where. Must be called after every
-// store mutation (load, add, edit, delete).
-function rebuildOrder() {
-  const n = store ? store.count : 0;
-  order = new Uint32Array(n);
+// store mutation (load, add, edit, delete), see rebuild().
+function rebuildOrder(s) {
+  const n = s.store.count;
+  const order = new Uint32Array(n);
   for (let i = 0; i < n; i++) order[i] = i;
-  order.sort((a, b) => store.compareRecords(a, b));
+  order.sort((a, b) => s.store.compareRecords(a, b));
+  s.order = order;
 }
 
-async function ensureConn() {
-  if (conn && conn.connected) return;
-  conn = new DowsConnection(settings.proxy, settings.ns);
-  await conn.connect();
+// Recompute everything derived from the store of session `s`.
+function rebuild(s) {
+  rebuildOrder(s);
+  s.catalog = parseCatalog(s.store);
+  applyFilter(s);
 }
 
-// Transfer the zone into a fresh store; the current store is only replaced
-// on success so a failed reload does not lose the working copy.
-async function transferZone(progress) {
-  await ensureConn();
-  const fresh = new ZoneStore(store ? store.zone : $("zone").value.trim());
-  let n = 0;
-  await axfr(conn, fresh.zoneFqdn, tsigKey, (rr) => {
-    fresh.add(fresh.relativize(rr.name), rr.type, rr.ttl, rr.rdata);
-    if (rr.type === TYPE_SOA) fresh.serial = soaSerial(rr.rdata);
-    // Report the very first record immediately (it signals that the server
-    // accepted the request), then every 1024 records. The serial is known
-    // from the first record on, since an AXFR starts with the SOA.
-    if (progress && (++n === 1 || (n & 1023) === 0)) progress(n, fresh.serial);
-  });
-  store = fresh;
+// Apply the session's filter to the list it currently shows.
+function applyFilter(s) {
+  const q = s.filter.trim().toLowerCase();
+  if (showsZones(s)) {
+    s.zoneView = !q
+      ? s.catalog.members
+      : s.catalog.members.filter(
+          (m) =>
+            m.zone.toLowerCase().includes(q) ||
+            m.id.toLowerCase().includes(q) ||
+            (m.group ?? "").toLowerCase().includes(q),
+        );
+  } else if (!q) {
+    s.view = null;
+  } else {
+    // Filter in display order so `view` stays sorted as well.
+    const v = [];
+    for (const idx of s.order) {
+      const r = s.store.get(idx);
+      if (
+        displayName(r.name).toLowerCase().includes(q) ||
+        typeToName(r.type).toLowerCase().includes(q) ||
+        rdataToText(r.type, r.rdata).toLowerCase().includes(q)
+      ) {
+        v.push(idx);
+      }
+    }
+    s.view = v;
+  }
+  if (s === cur) render();
 }
 
 function updateMeta() {
-  $("zone-meta").textContent =
-    "serial " + (store.serial ?? "?") + " · " + store.count + " records";
+  const s = cur;
+  let meta;
+  if (s.loadingSerial !== null) {
+    meta = "serial " + s.loadingSerial;
+  } else {
+    meta = "serial " + (s.store.serial ?? "?") + " · ";
+    meta += s.catalog
+      ? "catalog of " + s.catalog.members.length + " zones"
+      : s.store.count + " records";
+  }
+  $("zone-meta").textContent = meta;
 }
 
-function refreshList() {
-  vlist.setCount(view ? view.length : order.length);
+// Bring the zone view in line with the current session.
+function render() {
+  const s = cur;
+  const zones = showsZones(s);
+  $("zone-view").classList.toggle("catalog-mode", zones);
+  $("raw-btn").hidden = s.catalog === null;
+  $("raw-btn").setAttribute("aria-pressed", String(s.showRaw));
+  $("add-btn").textContent = zones ? "+ Add zone" : "+ Add record";
+  $("filter").placeholder = zones ? "Filter zones…" : "Filter records…";
+  updateMeta();
+  if (zones) zlist.setCount(s.zoneView.length);
+  else vlist.setCount(s.view ? s.view.length : s.order.length);
+}
+
+// Show session `s` in the zone view.
+function showSession(s) {
+  if (cur) {
+    cur.scroll = {
+      records: $("record-list").scrollTop,
+      zones: $("zone-list").scrollTop,
+    };
+  }
+  cur = s;
+  if (!vlist) {
+    vlist = new VirtualList($("record-list"), ROW_HEIGHT, renderRow);
+    zlist = new VirtualList($("zone-list"), ROW_HEIGHT, renderZoneRow);
+  }
+  $("zone-name").textContent = s.store.zoneFqdn;
+  $("filter").value = s.filter;
+  render();
+  $("record-list").scrollTop = s.scroll.records;
+  $("zone-list").scrollTop = s.scroll.zones;
+  setStatus(s, s.status.text, s.status.cls);
+}
+
+// Switch to session `s` and give it its own history entry, so the browser
+// back button returns to where it was opened from (and forward returns
+// here). Sessions deeper than `s` are dropped, as are their (now
+// unreachable) forward history entries by pushState().
+function enterSession(s) {
+  sessions.length = s.depth;
+  sessions.push(s);
+  showZoneView();
+  showSession(s);
+  history.pushState({ view: "zone", depth: s.depth }, "");
 }
 
 // ---- record list ----
@@ -148,9 +359,9 @@ function renderRow(i, el) {
   if (!el._c) buildRow(el);
   // Translate the DOM row index to an arena record index via the sorted
   // indirection array (or the filtered subset of it).
-  const rec = view ? view[i] : order[i];
+  const rec = cur.view ? cur.view[i] : cur.order[i];
   el._rec = rec;
-  const r = store.get(rec);
+  const r = cur.store.get(rec);
   const c = el._c;
   const data = rdataToText(r.type, r.rdata);
   c.name.textContent = displayName(r.name);
@@ -164,27 +375,140 @@ function renderRow(i, el) {
   el.classList.toggle("readonly", !editable);
 }
 
-function applyFilter() {
-  const q = $("filter").value.trim().toLowerCase();
-  if (!q) {
-    view = null;
-  } else {
-    // Filter in display order so `view` stays sorted as well.
-    const v = [];
-    for (const idx of order) {
-      const r = store.get(idx);
-      if (
-        displayName(r.name).toLowerCase().includes(q) ||
-        typeToName(r.type).toLowerCase().includes(q) ||
-        rdataToText(r.type, r.rdata).toLowerCase().includes(q)
-      ) {
-        v.push(idx);
-      }
-    }
-    view = v;
-  }
-  refreshList();
+// ---- catalog zone list ----
+
+function buildZoneRow(el) {
+  el.classList.add("zone-grid");
+  const mk = (tag, cls) => {
+    const s = document.createElement(tag);
+    s.className = cls;
+    el.appendChild(s);
+    return s;
+  };
+  const c = {
+    zone: mk("button", "c-zone"),
+    group: mk("span", "c-group"),
+    id: mk("span", "c-id"),
+    actions: mk("span", "c-actions"),
+  };
+  c.zone.title = "Open zone";
+  c.zone.addEventListener("click", () => openMember(el._member));
+  c.open = document.createElement("button");
+  c.open.className = "row-open";
+  c.open.textContent = "→";
+  c.open.title = "Open zone";
+  c.open.addEventListener("click", () => openMember(el._member));
+  c.del = document.createElement("button");
+  c.del.className = "row-del";
+  c.del.textContent = "✕";
+  c.del.title = "Remove zone from catalog";
+  c.del.addEventListener("click", () => deleteMember(el._member));
+  c.actions.append(c.open, c.del);
+  el._c = c;
 }
+
+function renderZoneRow(i, el) {
+  if (!el._c) buildZoneRow(el);
+  const m = cur.zoneView[i];
+  el._member = m;
+  const c = el._c;
+  c.zone.textContent = m.zone;
+  c.group.textContent = m.group ?? "";
+  c.group.title = m.group ?? "";
+  c.id.textContent = m.id;
+  c.id.title = m.id;
+}
+
+$("raw-btn").addEventListener("click", () => {
+  cur.showRaw = !cur.showRaw;
+  applyFilter(cur);
+});
+
+// Open a member zone of the current (catalog) session in a new session.
+// The view switches once the zone transfer got going; until then the
+// catalog stays visible.
+async function openMember(m) {
+  const parent = cur;
+  if (parent.opening) return;
+  parent.opening = true;
+  const s = newSession(m.zone, parent.tsigKey, parent.depth + 1);
+  setStatus(parent, "Opening " + m.zone + "…");
+  try {
+    await startLoad(s, () => {
+      // Do not navigate away if the user left the catalog meanwhile.
+      if (cur !== parent || $("zone-view").hidden) return;
+      setStatus(parent, "");
+      enterSession(s);
+    });
+  } catch (err) {
+    setStatus(
+      parent,
+      "✗ opening " + m.zone + " failed: " + err.message,
+      "error",
+    );
+  } finally {
+    parent.opening = false;
+  }
+}
+
+async function deleteMember(m) {
+  const s = cur;
+  if (!confirm("Remove " + m.zone + " from the catalog?")) return;
+  try {
+    setStatus(s, "Removing " + m.zone + "…");
+    const updates = deleteMemberUpdates(s.store, m);
+    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    // Remove from the highest index down, since removal shifts the
+    // indices of all later records.
+    for (const i of [...m.recs].sort((a, b) => b - a)) s.store.remove(i);
+    rebuild(s);
+    setStatus(s, "Removed " + m.zone + " from the catalog.", "ok");
+  } catch (err) {
+    setStatus(s, "✗ removing " + m.zone + " failed: " + err.message, "error");
+  }
+}
+
+function openZoneDialog() {
+  $("zone-status").textContent = "";
+  $("zone-new-name").value = "";
+  $("zone-new-group").value = "";
+  $("zone-dialog").showModal();
+}
+
+$("zone-cancel").addEventListener("click", () => $("zone-dialog").close());
+
+$("zone-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const s = cur;
+  const status = $("zone-status");
+  const btn = $("zone-save");
+  try {
+    btn.disabled = true;
+    status.textContent = "";
+    const zone =
+      $("zone-new-name").value.trim().toLowerCase().replace(/\.+$/, "") + ".";
+    if (zone === ".") throw new Error("zone name must not be empty");
+    nameToWire(zone); // validate
+    if (s.catalog.members.some((m) => m.zone.toLowerCase() === zone)) {
+      throw new Error(zone + " is already in the catalog");
+    }
+    const group = $("zone-new-group").value.trim();
+    const recs = memberRecords(zone, newMemberId(s.catalog), group);
+    const updates = addUpdates(s.store, recs);
+
+    status.textContent = "Sending update…";
+    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    for (const r of recs) s.store.add(r.name, r.type, r.ttl, r.rdata);
+
+    $("zone-dialog").close();
+    rebuild(s);
+    setStatus(s, "Added " + zone + " to the catalog.", "ok");
+  } catch (err) {
+    status.textContent = "✗ " + err.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ---- login ----
 
@@ -236,6 +560,9 @@ $("login-form").addEventListener("submit", async (e) => {
   const zone = $("zone").value.trim().toLowerCase().replace(/\.$/, "");
   const tsigSpec = $("tsig").value.trim();
 
+  // A fresh connection; the sessions of a previous login (still reachable
+  // via the forward button) keep theirs until this login succeeded.
+  let c = null;
   try {
     btn.disabled = true;
     status.textContent = "";
@@ -244,54 +571,38 @@ $("login-form").addEventListener("submit", async (e) => {
         "Web Crypto unavailable; serve this page via https:// or from localhost",
       );
     }
-    tsigKey = tsigSpec ? parseTsigSpec(tsigSpec) : null;
-    settings = { proxy, ns };
+    const tsigKey = tsigSpec ? parseTsigSpec(tsigSpec) : null;
     localStorage.setItem(SETTINGS_KEY, JSON.stringify({ proxy, ns, zone }));
 
     status.textContent = "Connecting to " + ns + "…";
-    if (conn) conn.close();
-    conn = new DowsConnection(proxy, ns);
-    await conn.connect();
+    c = new DowsConnection(proxy, ns);
+    await c.connect();
 
     status.textContent = "Transferring zone…";
-    store = new ZoneStore(zone);
-
+    const s = newSession(zone, tsigKey, 0);
     // The login conceptually ends with the first successful DNS message:
     // switch to the zone view right away and let the rest of the AXFR
     // report its progress in the bottom status bar, like a reload does.
-    let inZoneView = false;
-    try {
-      await transferZone((n, serial) => {
-        if (!inZoneView) {
-          inZoneView = true;
-          enterZoneView();
-        }
-        if (serial !== null) $("zone-meta").textContent = "serial " + serial;
-        setStatus("Transferring zone… " + n + " records");
-      });
-    } catch (err) {
-      if (!inZoneView) throw err; // login itself failed
-      setStatus("✗ zone transfer failed: " + err.message, "error");
-      return;
-    }
-    if (!inZoneView) enterZoneView();
-    rebuildOrder();
-    updateMeta();
-    refreshList();
-    setStatus("Zone loaded via AXFR (" + store.count + " records).", "ok");
+    await startLoad(
+      s,
+      () => {
+        if (conn && conn !== c) conn.close();
+        conn = c;
+        settings = { proxy, ns };
+        enterSession(s);
+      },
+      c,
+    );
   } catch (err) {
     status.textContent = "✗ " + err.message;
-    if (conn) {
-      conn.close();
-      conn = null;
-    }
+    if (c && c !== conn) c.close();
   } finally {
     btn.disabled = false;
   }
 });
 
 // Toggle between the login form and the zone view without touching any
-// state (connection, store, form inputs); used both by login and by
+// state (connection, sessions, form inputs); used both by login and by
 // history navigation.
 function showZoneView() {
   $("login-view").hidden = true;
@@ -305,23 +616,6 @@ function showLoginView() {
   $("toolbar").classList.remove("zone-active");
 }
 
-// Switch from the login form to the (possibly still loading) zone view.
-function enterZoneView() {
-  showZoneView();
-  $("zone-name").textContent = store.zoneFqdn;
-  $("zone-meta").textContent = "";
-  $("filter").value = "";
-  view = null;
-  if (!vlist) vlist = new VirtualList($("record-list"), ROW_HEIGHT, renderRow);
-  rebuildOrder();
-  refreshList();
-  if (history.state?.view != "zone") {
-    // Make the zone view a history entry so the browser back button returns
-    // to the login form (and forward returns here).
-    history.pushState({ view: "zone" }, "");
-  }
-}
-
 // ---- history navigation ----
 
 const LOGIN_FIELDS = ["proxy-url", "nameserver", "zone", "tsig"];
@@ -331,21 +625,26 @@ const LOGIN_FIELDS = ["proxy-url", "nameserver", "zone", "tsig"];
 let loginSnapshot = null;
 
 window.addEventListener("popstate", (e) => {
+  // Dialogs belong to the view being left.
+  for (const d of document.querySelectorAll("dialog[open]")) d.close();
   if (e.state && e.state.view === "zone") {
-    // Forward to the zone view. The connection and store are kept alive
-    // while on the login screen, so nothing needs to be reloaded.
-    if (!store) {
+    // Forward to a zone view, or back to a catalog. The connection and
+    // sessions are kept alive while on the login screen, so nothing needs
+    // to be reloaded.
+    const s = sessions[e.state.depth];
+    if (!s) {
       // No session behind this entry (it belongs to a previous page load);
       // bounce off it so the back button keeps working past it.
       history.forward();
       return;
     }
-    if (loginSnapshot) {
+    if (loginSnapshot && !$("login-view").hidden) {
       for (const id of LOGIN_FIELDS) $(id).value = loginSnapshot[id];
       updateProxyAboutLink();
       validateNameserver();
     }
     showZoneView();
+    showSession(s);
   } else {
     // Back to the login form: keep all inputs as they are, but remember
     // them so forward can undo any edits made in the meantime.
@@ -361,25 +660,27 @@ window.addEventListener("popstate", (e) => {
 // ---- refresh ----
 
 $("refresh-btn").addEventListener("click", async () => {
+  const s = cur;
   const btn = $("refresh-btn");
   try {
     btn.disabled = true;
-    setStatus("Reloading zone via AXFR…");
+    setStatus(s, "Reloading zone via AXFR…");
     // TODO(IXFR): request an incremental transfer based on store.serial.
-    await transferZone((n) => setStatus("Reloading zone… " + n + " records"));
-    rebuildOrder();
-    applyFilter();
-    updateMeta();
+    await transferZone(s, (n) =>
+      setStatus(s, "Reloading zone… " + n + " records"),
+    );
+    rebuild(s);
     setStatus(
+      s,
       "Zone reloaded (" +
-        store.count +
+        s.store.count +
         " records, serial " +
-        (store.serial ?? "?") +
+        (s.store.serial ?? "?") +
         ").",
       "ok",
     );
   } catch (err) {
-    setStatus("✗ reload failed: " + err.message, "error");
+    setStatus(s, "✗ reload failed: " + err.message, "error");
   } finally {
     btn.disabled = false;
   }
@@ -389,8 +690,10 @@ $("refresh-btn").addEventListener("click", async () => {
 
 let filterTimer = null;
 $("filter").addEventListener("input", () => {
+  const s = cur;
+  s.filter = $("filter").value;
   clearTimeout(filterTimer);
-  filterTimer = setTimeout(applyFilter, 150);
+  filterTimer = setTimeout(() => applyFilter(s), 150);
 });
 
 // ---- editing ----
@@ -403,7 +706,7 @@ soaOption.textContent = "SOA";
 function openEditor(rec) {
   editRec = rec;
   $("edit-status").textContent = "";
-  const isSoa = rec !== null && store.get(rec).type === TYPE_SOA;
+  const isSoa = rec !== null && cur.store.get(rec).type === TYPE_SOA;
   if (isSoa) $("edit-type").appendChild(soaOption);
   else soaOption.remove();
   $("edit-name").disabled = isSoa;
@@ -415,7 +718,7 @@ function openEditor(rec) {
     $("edit-type").value = "A";
     $("edit-data").value = "";
   } else {
-    const r = store.get(rec);
+    const r = cur.store.get(rec);
     $("edit-title").textContent = isSoa ? "Edit SOA record" : "Edit record";
     $("edit-name").value = displayName(r.name);
     $("edit-ttl").value = r.ttl;
@@ -437,11 +740,16 @@ for (const t of ADDABLE_TYPES) {
 }
 $("edit-type").addEventListener("change", updateDataHint);
 
-$("add-btn").addEventListener("click", () => openEditor(null));
+$("add-btn").addEventListener("click", () => {
+  if (showsZones(cur)) openZoneDialog();
+  else openEditor(null);
+});
 $("edit-cancel").addEventListener("click", () => $("edit-dialog").close());
 
 $("edit-form").addEventListener("submit", async (e) => {
   e.preventDefault();
+  const s = cur;
+  const store = s.store;
   const status = $("edit-status");
   const btn = $("edit-save");
   try {
@@ -466,18 +774,16 @@ $("edit-form").addEventListener("submit", async (e) => {
 
     if (type === TYPE_SOA) {
       status.textContent = "Sending update…";
-      const soa = await updateSoa(editRec, ttl, rdata);
+      const soa = await updateSoa(s, editRec, ttl, rdata);
       $("edit-dialog").close();
       if (!soa) {
-        setStatus("SOA record unchanged.");
+        setStatus(s, "SOA record unchanged.");
         return;
       }
       store.replace(editRec, "", TYPE_SOA, soa.ttl, soa.rdata);
       store.serial = soaSerial(soa.rdata);
-      rebuildOrder();
-      applyFilter();
-      updateMeta();
-      setStatus("Updated SOA record (serial " + store.serial + ").", "ok");
+      rebuild(s);
+      setStatus(s, "Updated SOA record (serial " + store.serial + ").", "ok");
       return;
     }
 
@@ -495,17 +801,15 @@ $("edit-form").addEventListener("submit", async (e) => {
     updates.push({ name: nameAbs, type, cls: CLASS_IN, ttl, rdata });
 
     status.textContent = "Sending update…";
-    await ensureConn();
-    await sendUpdate(conn, store.zoneFqdn, tsigKey, updates);
+    await withConn((c) => sendUpdate(c, store.zoneFqdn, s.tsigKey, updates));
 
     if (editRec !== null) store.replace(editRec, nameRel, type, ttl, rdata);
     else store.add(nameRel, type, ttl, rdata);
 
     $("edit-dialog").close();
-    rebuildOrder();
-    applyFilter();
-    updateMeta();
+    rebuild(s);
     setStatus(
+      s,
       (editRec !== null ? "Updated " : "Added ") +
         displayName(nameRel) +
         " " +
@@ -522,18 +826,18 @@ $("edit-form").addEventListener("submit", async (e) => {
 
 const SOA_ATTEMPTS = 5;
 
-// Change the SOA record `rec` to `ttl` and `rdata`, whose serial must be
-// left as is: the serial is incremented here, since servers silently
-// ignore SOA updates that do not increase it. A concurrent update may have
-// increased the serial meanwhile, which would also make this update be
-// ignored silently. Hence the update carries the SOA it is based on as
-// prerequisite (RFC 2136 Section 2.4.2, "RRset exists (value dependent)");
-// if that fails, the current SOA is fetched, the user's changes are merged
-// onto it and the update is retried.
+// Change the SOA record `rec` of session `s` to `ttl` and `rdata`, whose
+// serial must be left as is: the serial is incremented here, since servers
+// silently ignore SOA updates that do not increase it. A concurrent update
+// may have increased the serial meanwhile, which would also make this
+// update be ignored silently. Hence the update carries the SOA it is based
+// on as prerequisite (RFC 2136 Section 2.4.2, "RRset exists (value
+// dependent)"); if that fails, the current SOA is fetched, the user's
+// changes are merged onto it and the update is retried.
 //
 // Returns the new { ttl, rdata }, or null if nothing was changed.
-async function updateSoa(rec, ttl, rdata) {
-  const old = store.get(rec);
+async function updateSoa(s, rec, ttl, rdata) {
+  const old = s.store.get(rec);
   const base = soaFields(old.rdata);
   const edited = soaFields(rdata);
   if (edited.serial !== base.serial) {
@@ -544,36 +848,32 @@ async function updateSoa(rec, ttl, rdata) {
   if (ttl === old.ttl && soaRdata(edited).join() === soaRdata(base).join()) {
     return null;
   }
-  const apex = store.zoneFqdn;
+  const apex = s.store.zoneFqdn;
   let current = { ttl: old.ttl, rdata: old.rdata.slice() };
   for (let attempt = 1; ; attempt++) {
     const next = {
       ttl: ttl !== old.ttl ? ttl : current.ttl,
       rdata: soaRdata(mergeSoa(base, edited, soaFields(current.rdata))),
     };
+    const updates = [{ name: apex, type: TYPE_SOA, cls: CLASS_IN, ...next }];
+    const prereqs = [
+      {
+        name: apex,
+        type: TYPE_SOA,
+        cls: CLASS_IN,
+        ttl: 0,
+        rdata: current.rdata,
+      },
+    ];
     try {
-      await ensureConn();
-      await sendUpdate(
-        conn,
-        apex,
-        tsigKey,
-        [{ name: apex, type: TYPE_SOA, cls: CLASS_IN, ...next }],
-        [
-          {
-            name: apex,
-            type: TYPE_SOA,
-            cls: CLASS_IN,
-            ttl: 0,
-            rdata: current.rdata,
-          },
-        ],
-      );
+      await withConn((c) => sendUpdate(c, apex, s.tsigKey, updates, prereqs));
       return next;
     } catch (err) {
       const raced = err instanceof DnsError && err.rcode === RCODE_NXRRSET;
       if (!raced || attempt === SOA_ATTEMPTS) throw err;
-      await ensureConn();
-      const answers = await query(conn, apex, TYPE_SOA, tsigKey);
+      const answers = await withConn((c) =>
+        query(c, apex, TYPE_SOA, s.tsigKey),
+      );
       const soa = answers.find((rr) => rr.type === TYPE_SOA);
       if (!soa) throw new Error("the zone has no SOA record");
       current = { ttl: soa.ttl, rdata: soa.rdata };
@@ -582,31 +882,30 @@ async function updateSoa(rec, ttl, rdata) {
 }
 
 async function deleteRecord(rec) {
-  const r = store.get(rec);
+  const s = cur;
+  const r = s.store.get(rec);
   const what = displayName(r.name) + " " + typeToName(r.type);
   if (
     !confirm("Delete " + what + " record?\n\n" + rdataToText(r.type, r.rdata))
   )
     return;
   try {
-    setStatus("Deleting " + what + "…");
-    await ensureConn();
-    await sendUpdate(conn, store.zoneFqdn, tsigKey, [
+    setStatus(s, "Deleting " + what + "…");
+    const updates = [
       {
-        name: store.absolutize(r.name),
+        name: s.store.absolutize(r.name),
         type: r.type,
         cls: CLASS_NONE,
         ttl: 0,
         rdata: r.rdata,
       },
-    ]);
-    store.remove(rec);
-    rebuildOrder();
-    applyFilter();
-    updateMeta();
-    setStatus("Deleted " + what + " record.", "ok");
+    ];
+    await withConn((c) => sendUpdate(c, s.store.zoneFqdn, s.tsigKey, updates));
+    s.store.remove(rec);
+    rebuild(s);
+    setStatus(s, "Deleted " + what + " record.", "ok");
   } catch (err) {
-    setStatus("✗ delete failed: " + err.message, "error");
+    setStatus(s, "✗ delete failed: " + err.message, "error");
   }
 }
 
@@ -627,10 +926,12 @@ $("about-close").addEventListener("click", () => $("about-dialog").close());
 // Absence of history state marks the login view, which the page always
 // starts on. A (re)load can land in an entry carrying zone state from a
 // previous session; navigate back to the login entry, since that session
-// no longer exists. On a bfcache restore the store survives, so the zone
+// no longer exists. On a bfcache restore the sessions survive, so the zone
 // view stays usable.
 window.addEventListener("pageshow", () => {
-  if (history.state && !store) history.back();
+  if (history.state && !sessions.length) {
+    history.go(-(history.state.depth + 1));
+  }
 });
 restoreSettings();
 updateProxyAboutLink();
