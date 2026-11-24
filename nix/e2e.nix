@@ -43,7 +43,7 @@
           pkgs.writeShellApplication {
             name = "admin2136-test-env";
             runtimeInputs = [
-              pkgs.nodejs
+              pkgs.nodejs_latest
               pkgs.knot-dns
               inputs.dows.packages.${system}.dows
             ];
@@ -70,7 +70,7 @@
 
       devshells.e2e = {
         devshell.packages = [
-          pkgs.nodejs
+          pkgs.nodejs_latest
           pkgs.knot-dns
           pkgs.chromium
           inputs.dows.packages.${system}.dows

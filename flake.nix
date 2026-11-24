@@ -41,7 +41,7 @@
           # the standards devshell is all we need -- plus Node.js to run
           # the smoke tests.
           devShells.default = config.devShells.standards;
-          devshells.standards.devshell.packages = [ pkgs.nodejs ];
+          devshells.standards.devshell.packages = [ pkgs.nodejs_latest ];
 
           famedly.standards = {
             nix.projects."." = { };

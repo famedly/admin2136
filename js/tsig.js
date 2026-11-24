@@ -63,19 +63,12 @@ export function parseTsigSpec(spec) {
   }
   let secret;
   try {
-    secret = b64decode(secretB64);
+    secret = Uint8Array.fromBase64(secretB64);
   } catch (e) {
     throw new Error("TSIG secret is not valid base64");
   }
   if (secret.length === 0) throw new Error("TSIG secret is empty");
   return { name, algo, hash: ALGORITHMS[algo], secret, cryptoKey: null };
-}
-
-function b64decode(s) {
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
 }
 
 async function hmac(key, data) {

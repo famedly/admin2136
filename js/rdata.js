@@ -329,7 +329,7 @@ const FIELDS = {
   // Base64 data up to the end; may be split by whitespace.
   b64: {
     rest: true,
-    read: (r) => toBase64(nonEmpty(r.rest())),
+    read: (r) => nonEmpty(r.rest()).toBase64(),
     write: (w, toks) => w.bytes(nonEmpty(parseBase64(toks.join("")))),
   },
   // Length-prefixed hex, "-" when empty (NSEC3PARAM salt).
@@ -472,21 +472,11 @@ function parseHex(s) {
   return b;
 }
 
-function toBase64(b) {
-  let bin = "";
-  for (let i = 0; i < b.length; i += 0x8000)
-    bin += String.fromCharCode(...b.subarray(i, i + 0x8000));
-  return btoa(bin);
-}
-
 function parseBase64(s) {
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(s) || s.length % 4 !== 0) {
     throw new Error("invalid base64 data");
   }
-  const bin = atob(s);
-  const b = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) b[i] = bin.charCodeAt(i);
-  return b;
+  return Uint8Array.fromBase64(s);
 }
 
 // ---- SVCB / HTTPS (RFC 9460) ----
@@ -585,7 +575,7 @@ function formatSvcValue(key, v) {
         .map((a) => a.join("."))
         .join(",");
     case SVC_ECH:
-      return toBase64(nonEmpty(v));
+      return nonEmpty(v).toBase64();
     case SVC_IPV6HINT:
       return chunks(v, 16).map(formatIpv6).join(",");
     default:
