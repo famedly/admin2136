@@ -4,46 +4,6 @@
 
 // DNS wire format primitives: encoding, parsing, name (de)compression.
 
-export const TYPE_A = 1;
-export const TYPE_NS = 2;
-export const TYPE_CNAME = 5;
-export const TYPE_SOA = 6;
-export const TYPE_PTR = 12;
-export const TYPE_HINFO = 13;
-export const TYPE_MX = 15;
-export const TYPE_TXT = 16;
-export const TYPE_RP = 17;
-export const TYPE_AFSDB = 18;
-export const TYPE_RT = 21;
-export const TYPE_AAAA = 28;
-export const TYPE_SRV = 33;
-export const TYPE_NAPTR = 35;
-export const TYPE_KX = 36;
-export const TYPE_CERT = 37;
-export const TYPE_DNAME = 39;
-export const TYPE_DS = 43;
-export const TYPE_SSHFP = 44;
-export const TYPE_RRSIG = 46;
-export const TYPE_NSEC = 47;
-export const TYPE_DNSKEY = 48;
-export const TYPE_DHCID = 49;
-export const TYPE_NSEC3 = 50;
-export const TYPE_NSEC3PARAM = 51;
-export const TYPE_TLSA = 52;
-export const TYPE_SMIMEA = 53;
-export const TYPE_CDS = 59;
-export const TYPE_CDNSKEY = 60;
-export const TYPE_OPENPGPKEY = 61;
-export const TYPE_ZONEMD = 63;
-export const TYPE_SVCB = 64;
-export const TYPE_HTTPS = 65;
-export const TYPE_SPF = 99;
-export const TYPE_URI = 256;
-export const TYPE_CAA = 257;
-export const TYPE_TSIG = 250;
-export const TYPE_IXFR = 251;
-export const TYPE_AXFR = 252;
-
 export const CLASS_IN = 1;
 export const CLASS_NONE = 254;
 export const CLASS_ANY = 255;
@@ -51,52 +11,59 @@ export const CLASS_ANY = 255;
 export const OPCODE_QUERY = 0;
 export const OPCODE_UPDATE = 5;
 
-const TYPE_NAMES = {
-  1: "A",
-  2: "NS",
-  5: "CNAME",
-  6: "SOA",
-  12: "PTR",
-  13: "HINFO",
-  15: "MX",
-  16: "TXT",
-  17: "RP",
-  18: "AFSDB",
-  21: "RT",
-  28: "AAAA",
-  29: "LOC",
-  33: "SRV",
-  35: "NAPTR",
-  36: "KX",
-  37: "CERT",
-  39: "DNAME",
-  42: "APL",
-  43: "DS",
-  44: "SSHFP",
-  45: "IPSECKEY",
-  46: "RRSIG",
-  47: "NSEC",
-  48: "DNSKEY",
-  49: "DHCID",
-  50: "NSEC3",
-  51: "NSEC3PARAM",
-  52: "TLSA",
-  53: "SMIMEA",
-  55: "HIP",
-  59: "CDS",
-  60: "CDNSKEY",
-  61: "OPENPGPKEY",
-  62: "CSYNC",
-  63: "ZONEMD",
-  64: "SVCB",
-  65: "HTTPS",
-  99: "SPF",
-  108: "EUI48",
-  109: "EUI64",
-  250: "TSIG",
-  256: "URI",
-  257: "CAA",
+export const TYPES = {
+  A: 1,
+  NS: 2,
+  CNAME: 5,
+  SOA: 6,
+  PTR: 12,
+  HINFO: 13,
+  MX: 15,
+  TXT: 16,
+  RP: 17,
+  AFSDB: 18,
+  RT: 21,
+  AAAA: 28,
+  LOC: 29,
+  SRV: 33,
+  NAPTR: 35,
+  KX: 36,
+  CERT: 37,
+  DNAME: 39,
+  OPT: 41,
+  APL: 42,
+  DS: 43,
+  SSHFP: 44,
+  IPSECKEY: 45,
+  RRSIG: 46,
+  NSEC: 47,
+  DNSKEY: 48,
+  DHCID: 49,
+  NSEC3: 50,
+  NSEC3PARAM: 51,
+  TLSA: 52,
+  SMIMEA: 53,
+  HIP: 55,
+  CDS: 59,
+  CDNSKEY: 60,
+  OPENPGPKEY: 61,
+  CSYNC: 62,
+  ZONEMD: 63,
+  SVCB: 64,
+  HTTPS: 65,
+  SPF: 99,
+  EUI48: 108,
+  EUI64: 109,
+  TSIG: 250,
+  IXFR: 251,
+  AXFR: 252,
+  URI: 256,
+  CAA: 257,
 };
+
+const TYPE_NAMES = Object.fromEntries(
+  Object.entries(TYPES).map(([name, num]) => [num, name]),
+);
 
 export function typeToName(t) {
   return TYPE_NAMES[t] || "TYPE" + t;
@@ -104,9 +71,7 @@ export function typeToName(t) {
 
 export function nameToType(s) {
   s = s.trim().toUpperCase();
-  for (const [num, name] of Object.entries(TYPE_NAMES)) {
-    if (name === s) return Number(num);
-  }
+  if (Object.hasOwn(TYPES, s)) return TYPES[s];
   const m = /^TYPE(\d+)$/.exec(s);
   if (m) return Number(m[1]);
   return null;
@@ -235,16 +200,16 @@ export function buildQuery(id, qname, qtype, qclass = CLASS_IN) {
 // <character-string>, a number that many fixed-size bytes. Whatever follows
 // the listed fields is copied verbatim.
 const COMPRESSIBLE = {
-  [TYPE_NS]: ["n"],
-  [TYPE_CNAME]: ["n"],
-  [TYPE_SOA]: ["n", "n"],
-  [TYPE_PTR]: ["n"],
-  [TYPE_MX]: [2, "n"],
-  [TYPE_RP]: ["n", "n"],
-  [TYPE_AFSDB]: [2, "n"],
-  [TYPE_RT]: [2, "n"],
-  [TYPE_SRV]: [6, "n"],
-  [TYPE_NAPTR]: [4, "s", "s", "s", "n"],
+  [TYPES.NS]: ["n"],
+  [TYPES.CNAME]: ["n"],
+  [TYPES.SOA]: ["n", "n"],
+  [TYPES.PTR]: ["n"],
+  [TYPES.MX]: [2, "n"],
+  [TYPES.RP]: ["n", "n"],
+  [TYPES.AFSDB]: [2, "n"],
+  [TYPES.RT]: [2, "n"],
+  [TYPES.SRV]: [6, "n"],
+  [TYPES.NAPTR]: [4, "s", "s", "s", "n"],
 };
 
 // Decompress rdata into a self-contained buffer. Types whose rdata may

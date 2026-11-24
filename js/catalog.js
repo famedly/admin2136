@@ -16,8 +16,7 @@
 import {
   nameToWire,
   readName,
-  TYPE_PTR,
-  TYPE_TXT,
+  TYPES,
   CLASS_IN,
   CLASS_NONE,
 } from "./dnswire.js";
@@ -50,7 +49,7 @@ export function parseCatalog(store) {
   let version = null;
   for (const i of store.findName("version")) {
     const r = store.get(i);
-    if (r.type === TYPE_TXT) version = txtValue(r.rdata);
+    if (r.type === TYPES.TXT) version = txtValue(r.rdata);
   }
   if (version !== "1" && version !== "2") return null;
 
@@ -75,13 +74,13 @@ export function parseCatalog(store) {
       byId.set(m[2], member);
     }
     member.recs.push(i);
-    if (!m[1] && r.type === TYPE_PTR && member.zone === null) {
+    if (!m[1] && r.type === TYPES.PTR && member.zone === null) {
       try {
         member.zone = readName(r.rdata, 0)[0];
       } catch (e) {
         // malformed PTR; the member is skipped below
       }
-    } else if (m[1] === "group" && r.type === TYPE_TXT) {
+    } else if (m[1] === "group" && r.type === TYPES.TXT) {
       member.group = txtValue(r.rdata);
     }
   }
@@ -113,7 +112,7 @@ export function newMemberId(catalog) {
 export function memberRecords(zone, id, group) {
   const fqdn = zone.endsWith(".") ? zone : zone + ".";
   const recs = [
-    { name: id + ".zones", type: TYPE_PTR, ttl: 0, rdata: nameToWire(fqdn) },
+    { name: id + ".zones", type: TYPES.PTR, ttl: 0, rdata: nameToWire(fqdn) },
   ];
   if (group) {
     const b = te.encode(group);
@@ -123,7 +122,7 @@ export function memberRecords(zone, id, group) {
     rdata.set(b, 1);
     recs.push({
       name: "group." + id + ".zones",
-      type: TYPE_TXT,
+      type: TYPES.TXT,
       ttl: 0,
       rdata,
     });

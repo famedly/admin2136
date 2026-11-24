@@ -13,13 +13,7 @@ import {
   parseMessage,
   typeToName,
   nameToType,
-  TYPE_A,
-  TYPE_CNAME,
-  TYPE_SOA,
-  TYPE_TXT,
-  TYPE_AAAA,
-  TYPE_SSHFP,
-  TYPE_TSIG,
+  TYPES,
   CLASS_IN,
   CLASS_ANY,
   CLASS_NONE,
@@ -124,19 +118,19 @@ eq(
 
 // --- query build/parse ---
 {
-  const q = buildQuery(0x1234, "example.com.", TYPE_A);
+  const q = buildQuery(0x1234, "example.com.", TYPES.A);
   const p = parseMessage(q);
   eq("query id", p.id, 0x1234);
   eq("query qname", p.questions[0].name, "example.com.");
-  eq("query qtype", p.questions[0].type, TYPE_A);
+  eq("query qtype", p.questions[0].type, TYPES.A);
 }
 
 // --- full message with answer parse, incl. compressed CNAME rdata ---
 {
   const w = new Writer();
   w.u16(1).u16(0x8400).u16(1).u16(1).u16(0).u16(0);
-  w.name("example.com.").u16(TYPE_CNAME).u16(CLASS_IN); // question at offset 12
-  w.name("alias.example.com.").u16(TYPE_CNAME).u16(CLASS_IN).u32(300);
+  w.name("example.com.").u16(TYPES.CNAME).u16(CLASS_IN); // question at offset 12
+  w.name("alias.example.com.").u16(TYPES.CNAME).u16(CLASS_IN).u32(300);
   w.u16(2).u8(0xc0).u8(12); // rdata: pointer to "example.com." in question
   const p = parseMessage(w.done());
   eq("answer name", p.answers[0].name, "alias.example.com.");
@@ -148,8 +142,8 @@ eq(
 }
 
 // --- rdata text conversions ---
-eq("A text", rdataToText(TYPE_A, Uint8Array.of(192, 0, 2, 1)), "192.0.2.1");
-eq("A parse", hex(textToRdata(TYPE_A, "192.0.2.1")), "c0000201");
+eq("A text", rdataToText(TYPES.A, Uint8Array.of(192, 0, 2, 1)), "192.0.2.1");
+eq("A parse", hex(textToRdata(TYPES.A, "192.0.2.1")), "c0000201");
 eq("AAAA roundtrip", formatIpv6(parseIpv6("2001:db8::1")), "2001:db8::1");
 eq(
   "AAAA full form",
@@ -167,7 +161,7 @@ eq(
   hex(parseTxt('"hi" "yo"')),
   "0268690279 6f".replace(/\s/g, ""),
 );
-eq("TXT display", rdataToText(TYPE_TXT, parseTxt('"a\\"b"')), '"a\\"b"');
+eq("TXT display", rdataToText(TYPES.TXT, parseTxt('"a\\"b"')), '"a\\"b"');
 eq("TXT raw split", parseTxt("x".repeat(300)).length, 2 + 300);
 eq(
   "generic roundtrip",
@@ -186,23 +180,27 @@ check("NSEC is ignored", IGNORED_RRTYPES.has(nameToType("NSEC")));
 check("NSEC3 is ignored", IGNORED_RRTYPES.has(nameToType("NSEC3")));
 
 // SSHFP
-eq("SSHFP type number", TYPE_SSHFP, 44);
-eq("SSHFP parse", hex(textToRdata(TYPE_SSHFP, "4 2 aabbCCdd")), "0402aabbccdd");
+eq("SSHFP type number", TYPES.SSHFP, 44);
+eq(
+  "SSHFP parse",
+  hex(textToRdata(TYPES.SSHFP, "4 2 aabbCCdd")),
+  "0402aabbccdd",
+);
 eq(
   "SSHFP display",
-  rdataToText(TYPE_SSHFP, Uint8Array.of(4, 2, 0xaa, 0xbb, 0xcc, 0xdd)),
+  rdataToText(TYPES.SSHFP, Uint8Array.of(4, 2, 0xaa, 0xbb, 0xcc, 0xdd)),
   "4 2 aabbccdd",
 );
 eq(
   "SSHFP roundtrip",
-  rdataToText(TYPE_SSHFP, textToRdata(TYPE_SSHFP, "1 1 0123456789abcdef")),
+  rdataToText(TYPES.SSHFP, textToRdata(TYPES.SSHFP, "1 1 0123456789abcdef")),
   "1 1 0123456789abcdef",
 );
 check(
   "SSHFP rejects odd hex",
   (() => {
     try {
-      textToRdata(TYPE_SSHFP, "4 2 abc");
+      textToRdata(TYPES.SSHFP, "4 2 abc");
       return false;
     } catch (e) {
       return true;
@@ -316,8 +314,8 @@ check(
     ),
     "3 1 1 abcd",
   );
-  eq("SOA is editable", isEditableType(TYPE_SOA), true);
-  check("SOA cannot be added", !ADDABLE_TYPES.includes(TYPE_SOA));
+  eq("SOA is editable", isEditableType(TYPES.SOA), true);
+  check("SOA cannot be added", !ADDABLE_TYPES.includes(TYPES.SOA));
   check("unknown type is read-only", !isEditableType(999));
   check("CAA hint", typeHint(nameToType("CAA")).includes("issue"));
 
@@ -371,7 +369,7 @@ check(
 {
   const w = new Writer();
   w.u16(1).u16(0x8400).u16(1).u16(2).u16(0).u16(0);
-  w.name("example.com.").u16(TYPE_A).u16(CLASS_IN); // question at offset 12
+  w.name("example.com.").u16(TYPES.A).u16(CLASS_IN); // question at offset 12
   w.u8(0xc0).u8(12).u16(nameToType("SRV")).u16(CLASS_IN).u32(300);
   w.u16(10).u16(1).u16(2).u16(3).bytes([1, 0x78]).u8(0xc0).u8(12);
   w.u8(0xc0).u8(12).u16(nameToType("NAPTR")).u16(CLASS_IN).u32(300);
@@ -394,12 +392,12 @@ check(
   const abs = (n) => (n.endsWith(".") ? n : n + ".example.com.");
   eq(
     "CNAME relative",
-    readName(textToRdata(TYPE_CNAME, "www", abs), 0)[0],
+    readName(textToRdata(TYPES.CNAME, "www", abs), 0)[0],
     "www.example.com.",
   );
   eq(
     "CNAME absolute",
-    readName(textToRdata(TYPE_CNAME, "other.net.", abs), 0)[0],
+    readName(textToRdata(TYPES.CNAME, "other.net.", abs), 0)[0],
     "other.net.",
   );
 }
@@ -413,13 +411,13 @@ check(
   eq("soa serial", soaSerial(soa), 2024011501);
   check(
     "soa text contains serial",
-    rdataToText(TYPE_SOA, soa).includes("2024011501"),
+    rdataToText(TYPES.SOA, soa).includes("2024011501"),
   );
   eq("soa fields roundtrip", hex(soaRdata(soaFields(soa))), hex(soa));
 
   // Three-way merge: the user changed rname and minimum starting from
   // `base`; meanwhile another update raised the serial and changed retry.
-  const f = (text) => soaFields(textToRdata(TYPE_SOA, text));
+  const f = (text) => soaFields(textToRdata(TYPES.SOA, text));
   const base = f(
     "ns1.example.com. hostmaster.example.com. 5 7200 3600 1209600 300",
   );
@@ -431,7 +429,7 @@ check(
   );
   eq(
     "soa merge",
-    rdataToText(TYPE_SOA, soaRdata(mergeSoa(base, edited, current))),
+    rdataToText(TYPES.SOA, soaRdata(mergeSoa(base, edited, current))),
     "ns1.example.com. admin.example.com. 10 7200 900 1209600 60",
   );
   eq(
@@ -460,25 +458,25 @@ check(
   eq("absolutize rel", st.absolutize("www"), "www.example.com.");
   eq("absolutize abs", st.absolutize("other.net."), "other.net.");
 
-  const i0 = st.add("www", TYPE_A, 300, Uint8Array.of(192, 0, 2, 1));
-  const i1 = st.add("", TYPE_TXT, 60, parseTxt('"hello"'));
+  const i0 = st.add("www", TYPES.A, 300, Uint8Array.of(192, 0, 2, 1));
+  const i1 = st.add("", TYPES.TXT, 60, parseTxt('"hello"'));
   eq("store count", st.count, 2);
   const r0 = st.get(i0);
   eq("store get name", r0.name, "www");
-  eq("store get type", r0.type, TYPE_A);
+  eq("store get type", r0.type, TYPES.A);
   eq("store get ttl", r0.ttl, 300);
   eq("store get rdata", hex(r0.rdata), "c0000201");
-  st.replace(i0, "www", TYPE_A, 600, Uint8Array.of(192, 0, 2, 2));
+  st.replace(i0, "www", TYPES.A, 600, Uint8Array.of(192, 0, 2, 2));
   eq("store replace", st.get(i0).ttl, 600);
   st.remove(i0);
   eq("store remove count", st.count, 1);
-  eq("store remove shifts", st.get(0).type, TYPE_TXT);
+  eq("store remove shifts", st.get(0).type, TYPES.TXT);
 
   // stress: many records, arena growth
   for (let i = 0; i < 50000; i++) {
     st.add(
       "host-" + i,
-      TYPE_A,
+      TYPES.A,
       300,
       Uint8Array.of(10, i >> 16, (i >> 8) & 0xff, i & 0xff),
     );
@@ -492,14 +490,14 @@ check(
   const upd = buildUpdateMessage(7, "example.com.", [
     {
       name: "www.example.com.",
-      type: TYPE_A,
+      type: TYPES.A,
       cls: CLASS_NONE,
       ttl: 0,
       rdata: Uint8Array.of(192, 0, 2, 1),
     },
     {
       name: "www.example.com.",
-      type: TYPE_A,
+      type: TYPES.A,
       cls: CLASS_IN,
       ttl: 300,
       rdata: Uint8Array.of(192, 0, 2, 2),
@@ -508,7 +506,7 @@ check(
   const p = parseMessage(upd);
   eq("update opcode", p.opcode, 5);
   eq("update zone", p.questions[0].name, "example.com.");
-  eq("update zone type", p.questions[0].type, TYPE_SOA);
+  eq("update zone type", p.questions[0].type, TYPES.SOA);
   // prcount=0, upcount=2: update RRs occupy the "authority" section slot
   eq("update count", p.authority.length, 2);
   eq("update delete class", p.authority[0].cls, CLASS_NONE);
@@ -517,7 +515,7 @@ check(
   // prerequisites go into the answer section slot, before the updates
   const rr = (cls, ttl) => ({
     name: "example.com.",
-    type: TYPE_SOA,
+    type: TYPES.SOA,
     cls,
     ttl,
     rdata: Uint8Array.of(0, 0, ...new Array(20).fill(0)),
@@ -540,12 +538,12 @@ check(
 {
   const key = parseTsigSpec("hmac-sha256:KeyName:" + btoa("secret-bytes"));
   eq("tsig key name", key.name, "keyname");
-  const q = buildQuery(42, "example.com.", TYPE_SOA);
+  const q = buildQuery(42, "example.com.", TYPES.SOA);
   const signed = await signMessage(q, key);
   const p = parseMessage(signed);
   eq("tsig arcount", p.additional.length, 1);
   const tsig = p.additional[0];
-  eq("tsig rr type", tsig.type, TYPE_TSIG);
+  eq("tsig rr type", tsig.type, TYPES.TSIG);
   eq("tsig rr class", tsig.cls, CLASS_ANY);
   eq("tsig rr name", tsig.name, "keyname.");
   const [alg, o] = readName(tsig.rdata, 0);
@@ -635,7 +633,7 @@ check(
     const rdata = rd.done();
     const out = new Writer();
     out.bytes(msg);
-    out.bytes(keyWire).u16(TYPE_TSIG).u16(CLASS_ANY).u32(0);
+    out.bytes(keyWire).u16(TYPES.TSIG).u16(CLASS_ANY).u32(0);
     out.u16(rdata.length).bytes(rdata);
     const signed = out.done();
     signed[11] += 1; // bump ARCOUNT (test messages have ARCOUNT < 255)
@@ -653,13 +651,13 @@ check(
     }
   };
   const mkResp = () => {
-    const r = buildQuery(7, "example.com.", TYPE_SOA);
+    const r = buildQuery(7, "example.com.", TYPES.SOA);
     r[2] |= 0x80; // QR
     return r;
   };
 
   const session = new TsigSession(key);
-  await session.sign(buildQuery(7, "example.com.", TYPE_SOA));
+  await session.sign(buildQuery(7, "example.com.", TYPES.SOA));
 
   // Missing TSIG on the first response is fatal.
   await throws(
@@ -714,7 +712,7 @@ check(
   // Unsigned TSIG error response (MAC size 0) surfaces the error code.
   {
     const s = new TsigSession(key);
-    await s.sign(buildQuery(7, "example.com.", TYPE_SOA));
+    await s.sign(buildQuery(7, "example.com.", TYPES.SOA));
     const msg = mkResp();
     const rd = new Writer();
     rd.bytes(nameToWire(key.algo)).u48(0).u16(0);
@@ -723,7 +721,7 @@ check(
     const rdata = rd.done();
     const out = new Writer();
     out.bytes(msg);
-    out.bytes(nameToWire(key.name)).u16(TYPE_TSIG).u16(CLASS_ANY).u32(0);
+    out.bytes(nameToWire(key.name)).u16(TYPES.TSIG).u16(CLASS_ANY).u32(0);
     out.u16(rdata.length).bytes(rdata);
     const err = out.done();
     err[11] += 1;
@@ -733,7 +731,7 @@ check(
   // Wrong key name and stale timestamps are rejected.
   {
     const s = new TsigSession(key);
-    await s.sign(buildQuery(7, "example.com.", TYPE_SOA));
+    await s.sign(buildQuery(7, "example.com.", TYPES.SOA));
     const wrongKey = await serverSign(mkResp(), s.requestMac, {
       keyName: "otherkey",
     });
@@ -752,7 +750,7 @@ check(
     );
     // a correctly signed response reporting a TSIG error
     const s2 = new TsigSession(key);
-    await s2.sign(buildQuery(7, "example.com.", TYPE_SOA));
+    await s2.sign(buildQuery(7, "example.com.", TYPES.SOA));
     const signedError = await serverSign(mkResp(), s2.requestMac, {
       error: 18,
     });
@@ -776,14 +774,14 @@ check(
   const ip = Uint8Array.of(192, 0, 2, 1);
   // insertion order deliberately scrambled
   const recs = [
-    st.add("b.www", TYPE_A, 300, ip), //     rev: www.b
-    st.add("mail", TYPE_A, 300, ip), //      rev: mail
-    st.add("", TYPE_SOA, 300, soa), //       apex, first
-    st.add("www", TYPE_TXT, 60, parseTxt('"x"')), // rev: www, TXT(16) > A(1)
-    st.add("www", TYPE_A, 100, ip), //       rev: www, ttl 100 < 300
-    st.add("a.www", TYPE_A, 300, ip), //     rev: www.a
-    st.add("www", TYPE_A, 300, ip), //       rev: www, ttl 300
-    st.add("", TYPE_TXT, 60, parseTxt('"apex"')), // apex, TXT after SOA(6)
+    st.add("b.www", TYPES.A, 300, ip), //     rev: www.b
+    st.add("mail", TYPES.A, 300, ip), //      rev: mail
+    st.add("", TYPES.SOA, 300, soa), //       apex, first
+    st.add("www", TYPES.TXT, 60, parseTxt('"x"')), // rev: www, TXT(16) > A(1)
+    st.add("www", TYPES.A, 100, ip), //       rev: www, ttl 100 < 300
+    st.add("a.www", TYPES.A, 300, ip), //     rev: www.a
+    st.add("www", TYPES.A, 300, ip), //       rev: www, ttl 300
+    st.add("", TYPES.TXT, 60, parseTxt('"apex"')), // apex, TXT after SOA(6)
   ];
   const order = new Uint32Array(st.count);
   for (let i = 0; i < st.count; i++) order[i] = i;
@@ -1852,13 +1850,13 @@ check(
 {
   const resp = (rcode, tsigError = 0) => {
     const w = new Writer();
-    w.bytes(buildQuery(9, "example.com.", TYPE_SOA));
+    w.bytes(buildQuery(9, "example.com.", TYPES.SOA));
     if (tsigError) {
       const rd = new Writer();
       rd.name("hmac-sha256.").u48(0).u16(300).u16(0); // no MAC
       rd.u16(9).u16(tsigError).u16(0);
       const rdata = rd.done();
-      w.name("key.").u16(TYPE_TSIG).u16(CLASS_ANY).u32(0);
+      w.name("key.").u16(TYPES.TSIG).u16(CLASS_ANY).u32(0);
       w.u16(rdata.length).bytes(rdata);
     }
     const m = w.done();
@@ -1889,14 +1887,14 @@ check(
   const ptr = (n) => nameToWire(n);
   const mkCatalog = () => {
     const st = new ZoneStore("catalog.invalid");
-    st.add("", TYPE_SOA, 0, Uint8Array.of(0, 0, ...new Array(20).fill(0)));
+    st.add("", TYPES.SOA, 0, Uint8Array.of(0, 0, ...new Array(20).fill(0)));
     st.add("", nameToType("NS"), 0, nameToWire("invalid."));
-    st.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+    st.add("version", TYPES.TXT, 0, parseTxt('"2"'));
     st.add("b1.zones", nameToType("PTR"), 0, ptr("b.example."));
-    st.add("group.b1.zones", TYPE_TXT, 0, parseTxt('"web"'));
+    st.add("group.b1.zones", TYPES.TXT, 0, parseTxt('"web"'));
     st.add("A2.zones", nameToType("PTR"), 0, ptr("a.example."));
-    st.add("ext", TYPE_TXT, 0, parseTxt('"custom"'));
-    st.add("nozone.zones", TYPE_TXT, 0, parseTxt('"orphan property"'));
+    st.add("ext", TYPES.TXT, 0, parseTxt('"custom"'));
+    st.add("nozone.zones", TYPES.TXT, 0, parseTxt('"orphan property"'));
     return st;
   };
 
@@ -1905,15 +1903,15 @@ check(
   {
     const t = mkCatalog();
     const v2 = parseTxt('"2"');
-    eq("indexOf", t.indexOf("VERSION", TYPE_TXT, v2), 2);
+    eq("indexOf", t.indexOf("VERSION", TYPES.TXT, v2), 2);
     eq(
       "indexOf other rdata",
-      t.indexOf("version", TYPE_TXT, parseTxt('"3"')),
+      t.indexOf("version", TYPES.TXT, parseTxt('"3"')),
       -1,
     );
-    eq("indexOf other type", t.indexOf("version", TYPE_SOA, v2), -1);
+    eq("indexOf other type", t.indexOf("version", TYPES.SOA, v2), -1);
     t.remove(0);
-    eq("indexOf after shift", t.indexOf("version", TYPE_TXT, v2), 1);
+    eq("indexOf after shift", t.indexOf("version", TYPES.TXT, v2), 1);
   }
   const cat = parseCatalog(st);
   check("catalog detected", cat !== null);
@@ -1928,9 +1926,9 @@ check(
   );
 
   const plain = new ZoneStore("example.com");
-  plain.add("www", TYPE_A, 300, Uint8Array.of(192, 0, 2, 1));
+  plain.add("www", TYPES.A, 300, Uint8Array.of(192, 0, 2, 1));
   eq("plain zone is no catalog", parseCatalog(plain), null);
-  plain.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+  plain.add("version", TYPES.TXT, 0, parseTxt('"2"'));
   eq(
     "version alone with other records is no catalog",
     parseCatalog(plain),
@@ -1944,9 +1942,9 @@ check(
   );
 
   const empty = new ZoneStore("catalog.invalid");
-  empty.add("version", TYPE_TXT, 0, parseTxt('"2"'));
+  empty.add("version", TYPES.TXT, 0, parseTxt('"2"'));
   eq("empty catalog", parseCatalog(empty)?.members, []);
-  empty.replace(0, "version", TYPE_TXT, 0, parseTxt('"3"'));
+  empty.replace(0, "version", TYPES.TXT, 0, parseTxt('"3"'));
   eq("unknown catalog version", parseCatalog(empty), null);
 
   const id = newMemberId(cat);
@@ -1985,19 +1983,19 @@ check(
   };
   const SOA = (serial) => ({
     name: Z,
-    type: TYPE_SOA,
+    type: TYPES.SOA,
     ttl: 300,
     rdata: soaRdata(serial),
   });
   const A = (name, ip, ttl = 300) => ({
     name: name + "." + Z,
-    type: TYPE_A,
+    type: TYPES.A,
     ttl,
     rdata: parseIpv4(ip),
   });
   const TXT = (name, text) => ({
     name: name + "." + Z,
-    type: TYPE_TXT,
+    type: TYPES.TXT,
     ttl: 300,
     rdata: parseTxt(text),
   });
@@ -2133,11 +2131,11 @@ check(
   // applying the changes to a store: relative to the last transfer
   const mkStore = () => {
     const st = new ZoneStore("example.com");
-    st.add("", TYPE_SOA, 300, soaRdata(5));
-    st.add("www", TYPE_A, 300, parseIpv4("192.0.2.1"));
-    st.add("mail", TYPE_A, 300, parseIpv4("192.0.2.9"));
-    st.add("t", TYPE_TXT, 300, parseTxt('"keep"'));
-    st.add("t", TYPE_TXT, 300, parseTxt('"old"'));
+    st.add("", TYPES.SOA, 300, soaRdata(5));
+    st.add("www", TYPES.A, 300, parseIpv4("192.0.2.1"));
+    st.add("mail", TYPES.A, 300, parseIpv4("192.0.2.9"));
+    st.add("t", TYPES.TXT, 300, parseTxt('"keep"'));
+    st.add("t", TYPES.TXT, 300, parseTxt('"old"'));
     st.serial = 5;
     st.syncSoa = { ttl: 300, rdata: soaRdata(5) };
     st.markSynced();
@@ -2166,19 +2164,19 @@ check(
   // ones it silently ignored (phantom add, phantom delete, duplicate add,
   // phantom TTL change via replace, SOA edit).
   const st = mkStore();
-  st.add("mine", TYPE_A, 300, parseIpv4("192.0.2.50"));
-  st.add("phantom", TYPE_A, 300, parseIpv4("192.0.2.66"));
+  st.add("mine", TYPES.A, 300, parseIpv4("192.0.2.50"));
+  st.add("phantom", TYPES.A, 300, parseIpv4("192.0.2.66"));
   st.remove(2); // mail
-  st.add("www", TYPE_A, 300, parseIpv4("192.0.2.1")); // duplicate
-  st.replace(3, "t", TYPE_TXT, 999, parseTxt('"keep"'));
-  st.replace(0, "", TYPE_SOA, 300, soaRdata(6));
+  st.add("www", TYPES.A, 300, parseIpv4("192.0.2.1")); // duplicate
+  st.replace(3, "t", TYPES.TXT, 999, parseTxt('"keep"'));
+  st.replace(0, "", TYPES.SOA, 300, soaRdata(6));
   st.serial = 6;
 
   // revertToSynced() restores exactly the transferred contents
   const reverted = mkStore();
-  reverted.add("x", TYPE_A, 1, parseIpv4("192.0.2.99"));
+  reverted.add("x", TYPES.A, 1, parseIpv4("192.0.2.99"));
   reverted.remove(1);
-  reverted.replace(0, "", TYPE_SOA, 300, soaRdata(9));
+  reverted.replace(0, "", TYPES.SOA, 300, soaRdata(9));
   reverted.serial = 9;
   eq("revert reports changes", reverted.revertToSynced(), true);
   eq("revert restores contents", dump(reverted), base);
@@ -2222,7 +2220,7 @@ check(
     ],
   ]) {
     const bad = mkStore();
-    bad.add("local", TYPE_A, 300, parseIpv4("192.0.2.70"));
+    bad.add("local", TYPES.A, 300, parseIpv4("192.0.2.70"));
     eq(
       "applyChanges rejects " + what,
       bad.applyChanges(changes, SOA(7)),
@@ -2250,7 +2248,7 @@ check(
   st.compact();
   eq("compact keeps records", dump(st), before);
   check("compact shrinks arena", st.arenaLen < bloated / 10);
-  st.add("after", TYPE_A, 1, parseIpv4("192.0.2.8"));
+  st.add("after", TYPES.A, 1, parseIpv4("192.0.2.8"));
   eq("store usable after compact", st.get(st.count - 1).name, "after");
 }
 

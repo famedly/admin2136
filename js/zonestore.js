@@ -21,7 +21,7 @@
 // on the next full zone reload, or by compaction when applying incremental
 // changes leaves more garbage than live data.
 
-import { TYPE_SOA } from "./dnswire.js";
+import { TYPES } from "./dnswire.js";
 import { soaSerial } from "./rdata.js";
 
 const te = new TextEncoder();
@@ -257,7 +257,7 @@ export class ZoneStore {
       live += this._size(i);
       const r = this.get(i);
       const name = r.name.toLowerCase();
-      if (name === "" && r.type === TYPE_SOA) drop.add(i);
+      if (name === "" && r.type === TYPES.SOA) drop.add(i);
       else if (names.has(name)) found.set(key(name, r.type, r.rdata), i);
     }
 
@@ -276,7 +276,7 @@ export class ZoneStore {
     for (const { present, rel, rr } of state.values()) {
       if (present) this.add(rel, rr.type, rr.ttl, rr.rdata);
     }
-    this.add("", TYPE_SOA, soa.ttl, soa.rdata);
+    this.add("", TYPES.SOA, soa.ttl, soa.rdata);
     this.serial = soaSerial(soa.rdata);
     this.syncSoa = { ttl: soa.ttl, rdata: soa.rdata };
     if (this.arenaLen > 2 * live + (1 << 16)) this.compact();

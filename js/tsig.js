@@ -10,13 +10,7 @@
 // MAC so every received message is authenticated (RFC 8945 Section 5.3.1
 // and 5.4).
 
-import {
-  Writer,
-  nameToWire,
-  readName,
-  TYPE_TSIG,
-  CLASS_ANY,
-} from "./dnswire.js";
+import { Writer, nameToWire, readName, TYPES, CLASS_ANY } from "./dnswire.js";
 
 const ALGORITHMS = {
   "hmac-sha1": "SHA-1",
@@ -116,7 +110,7 @@ async function signWithMac(msg, key) {
 
   const out = new Writer(msg.length + keyWire.length + rdata.length + 10);
   out.bytes(msg);
-  out.bytes(keyWire).u16(TYPE_TSIG).u16(CLASS_ANY).u32(0);
+  out.bytes(keyWire).u16(TYPES.TSIG).u16(CLASS_ANY).u32(0);
   out.u16(rdata.length).bytes(rdata);
   const signed = out.done();
 
@@ -165,7 +159,7 @@ function locateTsig(msg) {
     const rd = off + 10;
     off = rd + rdlen;
     if (off > msg.length) throw new Error("truncated rdata");
-    if (type !== TYPE_TSIG) continue;
+    if (type !== TYPES.TSIG) continue;
     if (i !== nrrs - 1 || counts[3] === 0) {
       throw new Error("TSIG RR is not the last record of the message");
     }

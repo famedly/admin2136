@@ -9,44 +9,7 @@
 // Everything else is shown as RFC 3597 generic data: \# <len> <hex>; that
 // notation is also accepted as input for any type.
 
-import {
-  Writer,
-  readName,
-  typeToName,
-  TYPE_A,
-  TYPE_NS,
-  TYPE_CNAME,
-  TYPE_SOA,
-  TYPE_PTR,
-  TYPE_HINFO,
-  TYPE_MX,
-  TYPE_TXT,
-  TYPE_RP,
-  TYPE_AFSDB,
-  TYPE_RT,
-  TYPE_AAAA,
-  TYPE_SRV,
-  TYPE_NAPTR,
-  TYPE_KX,
-  TYPE_CERT,
-  TYPE_DNAME,
-  TYPE_DS,
-  TYPE_SSHFP,
-  TYPE_DNSKEY,
-  TYPE_DHCID,
-  TYPE_NSEC3PARAM,
-  TYPE_TLSA,
-  TYPE_SMIMEA,
-  TYPE_CDS,
-  TYPE_CDNSKEY,
-  TYPE_OPENPGPKEY,
-  TYPE_ZONEMD,
-  TYPE_SVCB,
-  TYPE_HTTPS,
-  TYPE_SPF,
-  TYPE_URI,
-  TYPE_CAA,
-} from "./dnswire.js";
+import { Writer, readName, typeToName, TYPES } from "./dnswire.js";
 
 const te = new TextEncoder();
 
@@ -78,63 +41,63 @@ const TXT_LIKE = {
 };
 
 const SCHEMAS = {
-  [TYPE_A]: { fields: ["ipv4"], hint: "<IPv4 address>" },
-  [TYPE_NS]: { fields: ["name"], hint: "<nameserver>" },
-  [TYPE_CNAME]: { fields: ["name"], hint: "<target>" },
-  [TYPE_SOA]: {
+  [TYPES.A]: { fields: ["ipv4"], hint: "<IPv4 address>" },
+  [TYPES.NS]: { fields: ["name"], hint: "<nameserver>" },
+  [TYPES.CNAME]: { fields: ["name"], hint: "<target>" },
+  [TYPES.SOA]: {
     fields: ["name", "name", "u32", "u32", "u32", "u32", "u32"],
     hint: "<mname> <rname> <serial> <refresh> <retry> <expire> <minimum>",
   },
-  [TYPE_PTR]: { fields: ["name"], hint: "<target>" },
-  [TYPE_HINFO]: { fields: ["str", "str"], hint: '"<cpu>" "<os>"' },
-  [TYPE_MX]: { fields: ["u16", "name"], hint: "<preference> <exchange>" },
-  [TYPE_TXT]: TXT_LIKE,
-  [TYPE_RP]: { fields: ["name", "name"], hint: "<mailbox> <txt name>" },
-  [TYPE_AFSDB]: { fields: ["u16", "name"], hint: "<subtype> <hostname>" },
-  [TYPE_RT]: { fields: ["u16", "name"], hint: "<preference> <host>" },
-  [TYPE_AAAA]: { fields: ["ipv6"], hint: "<IPv6 address>" },
-  [TYPE_SRV]: {
+  [TYPES.PTR]: { fields: ["name"], hint: "<target>" },
+  [TYPES.HINFO]: { fields: ["str", "str"], hint: '"<cpu>" "<os>"' },
+  [TYPES.MX]: { fields: ["u16", "name"], hint: "<preference> <exchange>" },
+  [TYPES.TXT]: TXT_LIKE,
+  [TYPES.RP]: { fields: ["name", "name"], hint: "<mailbox> <txt name>" },
+  [TYPES.AFSDB]: { fields: ["u16", "name"], hint: "<subtype> <hostname>" },
+  [TYPES.RT]: { fields: ["u16", "name"], hint: "<preference> <host>" },
+  [TYPES.AAAA]: { fields: ["ipv6"], hint: "<IPv6 address>" },
+  [TYPES.SRV]: {
     fields: ["u16", "u16", "u16", "name"],
     hint: "<priority> <weight> <port> <target>",
   },
-  [TYPE_NAPTR]: {
+  [TYPES.NAPTR]: {
     fields: ["u16", "u16", "str", "str", "str", "name"],
     hint: '<order> <preference> "<flags>" "<services>" "<regexp>" <replacement>',
   },
-  [TYPE_KX]: { fields: ["u16", "name"], hint: "<preference> <exchanger>" },
-  [TYPE_CERT]: {
+  [TYPES.KX]: { fields: ["u16", "name"], hint: "<preference> <exchanger>" },
+  [TYPES.CERT]: {
     fields: ["u16", "u16", "u8", "b64"],
     hint: "<type> <key tag> <algorithm> <certificate base64>",
   },
-  [TYPE_DNAME]: { fields: ["name"], hint: "<target>" },
-  [TYPE_DS]: DS_LIKE,
-  [TYPE_SSHFP]: {
+  [TYPES.DNAME]: { fields: ["name"], hint: "<target>" },
+  [TYPES.DS]: DS_LIKE,
+  [TYPES.SSHFP]: {
     fields: ["u8", "u8", "hex"],
     hint: "<algorithm> <fptype> <fingerprint hex>",
   },
-  [TYPE_DNSKEY]: DNSKEY_LIKE,
-  [TYPE_DHCID]: { fields: ["b64"], hint: "<data base64>" },
-  [TYPE_NSEC3PARAM]: {
+  [TYPES.DNSKEY]: DNSKEY_LIKE,
+  [TYPES.DHCID]: { fields: ["b64"], hint: "<data base64>" },
+  [TYPES.NSEC3PARAM]: {
     fields: ["u8", "u8", "u16", "salt"],
     hint: "<algorithm> <flags> <iterations> <salt hex or ->",
   },
-  [TYPE_TLSA]: TLSA_LIKE,
-  [TYPE_SMIMEA]: TLSA_LIKE,
-  [TYPE_CDS]: DS_LIKE,
-  [TYPE_CDNSKEY]: DNSKEY_LIKE,
-  [TYPE_OPENPGPKEY]: { fields: ["b64"], hint: "<public key base64>" },
-  [TYPE_ZONEMD]: {
+  [TYPES.TLSA]: TLSA_LIKE,
+  [TYPES.SMIMEA]: TLSA_LIKE,
+  [TYPES.CDS]: DS_LIKE,
+  [TYPES.CDNSKEY]: DNSKEY_LIKE,
+  [TYPES.OPENPGPKEY]: { fields: ["b64"], hint: "<public key base64>" },
+  [TYPES.ZONEMD]: {
     fields: ["u32", "u8", "u8", "hex"],
     hint: "<serial> <scheme> <hash algorithm> <digest hex>",
   },
-  [TYPE_SVCB]: SVCB_LIKE,
-  [TYPE_HTTPS]: SVCB_LIKE,
-  [TYPE_SPF]: TXT_LIKE,
-  [TYPE_URI]: {
+  [TYPES.SVCB]: SVCB_LIKE,
+  [TYPES.HTTPS]: SVCB_LIKE,
+  [TYPES.SPF]: TXT_LIKE,
+  [TYPES.URI]: {
     fields: ["u16", "u16", "rest"],
     hint: '<priority> <weight> "<target URI>"',
   },
-  [TYPE_CAA]: {
+  [TYPES.CAA]: {
     fields: ["u8", "tag", "rest"],
     hint: '<flags> <tag> "<value>", e.g. 0 issue "ca.example.net"',
   },
@@ -144,7 +107,7 @@ const SCHEMAS = {
 // exactly once per zone: it can be edited, but not added.
 export const ADDABLE_TYPES = Object.keys(SCHEMAS)
   .map(Number)
-  .filter((t) => t !== TYPE_SOA)
+  .filter((t) => t !== TYPES.SOA)
   .sort((a, b) => (typeToName(a) < typeToName(b) ? -1 : 1));
 
 export function isEditableType(type) {

@@ -9,13 +9,7 @@ import {
   Writer,
   buildQuery,
   parseMessage,
-  TYPE_SOA,
-  TYPE_RRSIG,
-  TYPE_NSEC,
-  TYPE_NSEC3,
-  TYPE_AXFR,
-  TYPE_IXFR,
-  TYPE_TSIG,
+  TYPES,
   CLASS_IN,
   OPCODE_UPDATE,
 } from "./dnswire.js";
@@ -44,7 +38,6 @@ export const RCODE_YXRRSET = 7;
 export const RCODE_NXRRSET = 8;
 const RCODE_NOTAUTH = 9;
 
-const TYPE_OPT = 41;
 const EDNS_EDE = 15; // Extended DNS Error option (RFC 8914)
 const EDE_INVALID_DATA = 24;
 
@@ -54,7 +47,7 @@ export function rcodeName(rc) {
 
 // RRtypes that are dropped when received: they are never stored in the
 // client state nor shown in the UI.
-export const IGNORED_RRTYPES = new Set([TYPE_RRSIG, TYPE_NSEC, TYPE_NSEC3]);
+export const IGNORED_RRTYPES = new Set([TYPES.RRSIG, TYPES.NSEC, TYPES.NSEC3]);
 
 function randId() {
   return crypto.getRandomValues(new Uint16Array(1))[0];
@@ -64,7 +57,7 @@ function randId() {
 // TSIG error name (e.g. "BADKEY") or null, `response` the parsed message.
 export class DnsError extends Error {
   constructor(what, resp) {
-    const tsig = resp.additional.find((rr) => rr.type === TYPE_TSIG);
+    const tsig = resp.additional.find((rr) => rr.type === TYPES.TSIG);
     const tsigError = tsig ? tsigErrorName(tsig.rdata) : null;
     super(
       what +
@@ -171,10 +164,10 @@ async function streamTransfer(conn, msg, tsigKey, what, onRecord) {
 // Returns the number of records seen.
 export async function axfr(conn, zone, tsigKey, onRecord) {
   let count = 0;
-  const msg = buildQuery(randId(), zone, TYPE_AXFR);
+  const msg = buildQuery(randId(), zone, TYPES.AXFR);
   await streamTransfer(conn, msg, tsigKey, "AXFR", (rr) => {
-    if (rr.type === TYPE_SOA && count > 0) return true; // terminator SOA
-    if (count === 0 && rr.type !== TYPE_SOA) {
+    if (rr.type === TYPES.SOA && count > 0) return true; // terminator SOA
+    if (count === 0 && rr.type !== TYPES.SOA) {
       throw new Error("AXFR stream did not start with SOA");
     }
     onRecord(rr);
@@ -195,8 +188,8 @@ export function serialGt(a, b) {
 export function buildIxfrQuery(id, zone, soa) {
   const w = new Writer(128);
   w.u16(id).u16(0).u16(1).u16(0).u16(1).u16(0);
-  w.name(zone).u16(TYPE_IXFR).u16(CLASS_IN);
-  w.name(zone).u16(TYPE_SOA).u16(CLASS_IN).u32(soa.ttl);
+  w.name(zone).u16(TYPES.IXFR).u16(CLASS_IN);
+  w.name(zone).u16(TYPES.SOA).u16(CLASS_IN).u32(soa.ttl);
   w.u16(soa.rdata.length).bytes(soa.rdata);
   return w.done();
 }
@@ -221,7 +214,7 @@ export async function ixfr(conn, zone, tsigKey, soa, onFullRecord, onProgress) {
   const msg = buildIxfrQuery(randId(), zone, soa);
   await streamTransfer(conn, msg, tsigKey, "IXFR", (rr) => {
     if (++n % 1024 === 0 && onProgress) onProgress(n);
-    const isSoa = rr.type === TYPE_SOA;
+    const isSoa = rr.type === TYPES.SOA;
     if (n === 1) {
       if (!isSoa) throw new Error("IXFR stream did not start with SOA");
       result.soa = rr;
@@ -270,7 +263,7 @@ export function buildUpdateMessage(id, zone, updates, prereqs = []) {
   const w = new Writer(128);
   w.u16(id).u16(OPCODE_UPDATE << 11);
   w.u16(1).u16(prereqs.length).u16(updates.length).u16(0);
-  w.name(zone).u16(TYPE_SOA).u16(CLASS_IN); // zone section
+  w.name(zone).u16(TYPES.SOA).u16(CLASS_IN); // zone section
   for (const u of [...prereqs, ...updates]) {
     w.name(u.name).u16(u.type).u16(u.cls).u32(u.ttl);
     w.u16(u.rdata.length).bytes(u.rdata);
@@ -327,7 +320,7 @@ export async function query(
 // Append an empty OPT record (UDP payload size 1232) to message `msg`.
 function withOpt(msg) {
   const w = new Writer(msg.length + 11);
-  w.bytes(msg).u8(0).u16(TYPE_OPT).u16(1232).u32(0).u16(0);
+  w.bytes(msg).u8(0).u16(TYPES.OPT).u16(1232).u32(0).u16(0);
   const out = w.done();
   out[11] += 1; // ARCOUNT (queries have no other additional records)
   return out;
@@ -337,7 +330,7 @@ function withOpt(msg) {
 export function ednsErrors(resp) {
   const codes = [];
   for (const rr of resp.additional) {
-    if (rr.type !== TYPE_OPT) continue;
+    if (rr.type !== TYPES.OPT) continue;
     const d = rr.rdata;
     for (let o = 0; o + 4 <= d.length; ) {
       const code = (d[o] << 8) | d[o + 1];

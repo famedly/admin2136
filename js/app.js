@@ -51,10 +51,7 @@ import {
   readName,
   typeToName,
   nameToType,
-  TYPE_NS,
-  TYPE_SOA,
-  TYPE_DS,
-  TYPE_DNSKEY,
+  TYPES,
   CLASS_IN,
   CLASS_NONE,
 } from "./dnswire.js";
@@ -309,7 +306,7 @@ async function transferZone(s, progress, c = null) {
   const run = (c) =>
     axfr(c, fresh.zoneFqdn, s.tsigKey, (rr) => {
       fresh.add(fresh.relativize(rr.name), rr.type, rr.ttl, rr.rdata);
-      if (rr.type === TYPE_SOA) {
+      if (rr.type === TYPES.SOA) {
         fresh.serial = soaSerial(rr.rdata);
         fresh.syncSoa = { ttl: rr.ttl, rdata: rr.rdata };
       }
@@ -593,7 +590,7 @@ function renderRow(i, el) {
   c.data.title = data;
   const editable = isEditableType(r.type);
   c.edit.disabled = !editable;
-  c.del.disabled = r.type === TYPE_SOA;
+  c.del.disabled = r.type === TYPES.SOA;
   el.classList.toggle("readonly", !editable);
 }
 
@@ -783,8 +780,8 @@ async function fetchZoneInfo(s) {
   let res;
   try {
     const questions = zones.flatMap((name) => [
-      { name, type: TYPE_SOA },
-      { name, type: TYPE_NS },
+      { name, type: TYPES.SOA },
+      { name, type: TYPES.NS },
     ]);
     res = await withConn((c) => queryAll(c, questions));
   } catch (err) {
@@ -813,19 +810,19 @@ async function fetchZoneInfo(s) {
 // The info of a zone from the responses to its SOA and NS queries.
 function zoneInfo(soaResp, nsResp) {
   const soa =
-    soaResp.rcode === 0 && soaResp.answers.find((rr) => rr.type === TYPE_SOA);
+    soaResp.rcode === 0 && soaResp.answers.find((rr) => rr.type === TYPES.SOA);
   if (soa) {
     const f = soaFields(soa.rdata);
     const ns =
       nsResp.rcode === 0
-        ? nsResp.answers.filter((rr) => rr.type === TYPE_NS)
+        ? nsResp.answers.filter((rr) => rr.type === TYPES.NS)
         : [];
     const names = ns.map((rr) => readName(rr.rdata, 0)[0]).sort();
     return {
       state: "ok",
       soa: f,
       soaTtl: soa.ttl,
-      soaText: rdataToText(TYPE_SOA, soa.rdata),
+      soaText: rdataToText(TYPES.SOA, soa.rdata),
       // The primary nameserver of the SOA has an NS record anyway.
       additional: names.filter((n) => zkey(n) !== zkey(f.mname)),
       nsTtl: ns.length ? ns[0].ttl : soa.ttl,
@@ -942,7 +939,7 @@ async function createZone(s, row) {
     const target = s.setup ? s : newSession(zone, s.tsigKey, s.depth + 1);
     const { updates, prereqs } = zoneSetupUpdates(
       target.store,
-      textToRdata(TYPE_SOA, edit.soa, (n) => target.store.absolutize(n)),
+      textToRdata(TYPES.SOA, edit.soa, (n) => target.store.absolutize(n)),
       edit.soaTtl,
       edit.ns.split(/\s+/).filter(Boolean),
       edit.nsTtl,
@@ -992,7 +989,7 @@ async function createZone(s, row) {
 async function waitForZone(zone) {
   for (let i = 0; ; i++) {
     try {
-      await withConn((c) => query(c, zone, TYPE_SOA, null, { edns: true }));
+      await withConn((c) => query(c, zone, TYPES.SOA, null, { edns: true }));
       return; // it even has records already
     } catch (err) {
       if (err instanceof DnsError && isUnsetZoneResponse(err.response)) return;
@@ -1017,10 +1014,10 @@ function zoneSetupUpdates(store, soa, soaTtl, additional, nsTtl) {
   }
   return {
     updates: [
-      { name: apex, type: TYPE_SOA, cls: CLASS_IN, ttl: soaTtl, rdata: soa },
+      { name: apex, type: TYPES.SOA, cls: CLASS_IN, ttl: soaTtl, rdata: soa },
       ...names.map((n) => ({
         name: apex,
-        type: TYPE_NS,
+        type: TYPES.NS,
         cls: CLASS_IN,
         ttl: nsTtl,
         rdata: nameToWire(n),
@@ -1031,7 +1028,7 @@ function zoneSetupUpdates(store, soa, soaTtl, additional, nsTtl) {
     prereqs: [
       {
         name: apex,
-        type: TYPE_SOA,
+        type: TYPES.SOA,
         cls: CLASS_NONE,
         ttl: 0,
         rdata: new Uint8Array(0),
@@ -1057,8 +1054,8 @@ async function dnssecRecords(apex) {
   // A signing server adds the keys with the zone, but give it a moment.
   for (let i = 0; i < 3 && !keys.length; i++) {
     if (i) await new Promise((r) => setTimeout(r, 300));
-    const answers = await withConn((c) => query(c, apex, TYPE_DNSKEY, null));
-    keys = answers.filter((rr) => rr.type === TYPE_DNSKEY);
+    const answers = await withConn((c) => query(c, apex, TYPES.DNSKEY, null));
+    keys = answers.filter((rr) => rr.type === TYPES.DNSKEY);
   }
   if (!keys.length) return null;
   const line = (rr, type, rdata) =>
@@ -1072,11 +1069,11 @@ async function dnssecRecords(apex) {
   const ds = [];
   for (const rdata of dsKeys(keys.map((rr) => rr.rdata))) {
     const rr = keys.find((k) => k.rdata === rdata);
-    ds.push(line(rr, TYPE_DS, await dsRdata(apex, rdata)));
+    ds.push(line(rr, TYPES.DS, await dsRdata(apex, rdata)));
   }
   return {
     ds: ds.join("\n"),
-    dnskey: keys.map((rr) => line(rr, TYPE_DNSKEY, rr.rdata)).join("\n"),
+    dnskey: keys.map((rr) => line(rr, TYPES.DNSKEY, rr.rdata)).join("\n"),
   };
 }
 
@@ -1176,7 +1173,7 @@ async function deleteMember(m) {
 // `c` is the connection to use, if not the shared one.
 async function isUnsetZone(err, zone, c = null) {
   if (!(err instanceof DnsError && err.rcode === RCODE_SERVFAIL)) return false;
-  const run = (c) => query(c, zone, TYPE_SOA, null, { edns: true });
+  const run = (c) => query(c, zone, TYPES.SOA, null, { edns: true });
   try {
     await (c ? runOn(c, run) : withConn(run));
     return false; // the zone has a SOA after all
@@ -1487,7 +1484,7 @@ soaOption.textContent = "SOA";
 function openEditor(rec) {
   editOld = rec === null ? null : cur.store.get(rec);
   $("edit-status").textContent = "";
-  const isSoa = editOld !== null && editOld.type === TYPE_SOA;
+  const isSoa = editOld !== null && editOld.type === TYPES.SOA;
   if (isSoa) $("edit-type").appendChild(soaOption);
   else soaOption.remove();
   $("edit-name").disabled = isSoa;
@@ -1555,7 +1552,7 @@ $("edit-form").addEventListener("submit", async (e) => {
     );
     const nameAbs = store.absolutize(nameRel);
 
-    if (type === TYPE_SOA) {
+    if (type === TYPES.SOA) {
       status.textContent = "Sending update…";
       const soa = await updateSoa(s, old, ttl, rdata);
       $("edit-dialog").close();
@@ -1564,9 +1561,9 @@ $("edit-form").addEventListener("submit", async (e) => {
         return;
       }
       const live = s.store;
-      const i = live.findName("").find((i) => live.get(i).type === TYPE_SOA);
-      if (i === undefined) live.add("", TYPE_SOA, soa.ttl, soa.rdata);
-      else live.replace(i, "", TYPE_SOA, soa.ttl, soa.rdata);
+      const i = live.findName("").find((i) => live.get(i).type === TYPES.SOA);
+      if (i === undefined) live.add("", TYPES.SOA, soa.ttl, soa.rdata);
+      else live.replace(i, "", TYPES.SOA, soa.ttl, soa.rdata);
       live.serial = soaSerial(soa.rdata);
       rebuild(s);
       setStatus(s, "Updated SOA record (serial " + live.serial + ").", "ok");
@@ -1649,11 +1646,11 @@ async function updateSoa(s, old, ttl, rdata) {
       ttl: ttl !== old.ttl ? ttl : current.ttl,
       rdata: soaRdata(mergeSoa(base, edited, soaFields(current.rdata))),
     };
-    const updates = [{ name: apex, type: TYPE_SOA, cls: CLASS_IN, ...next }];
+    const updates = [{ name: apex, type: TYPES.SOA, cls: CLASS_IN, ...next }];
     const prereqs = [
       {
         name: apex,
-        type: TYPE_SOA,
+        type: TYPES.SOA,
         cls: CLASS_IN,
         ttl: 0,
         rdata: current.rdata,
@@ -1666,9 +1663,9 @@ async function updateSoa(s, old, ttl, rdata) {
       const raced = err instanceof DnsError && err.rcode === RCODE_NXRRSET;
       if (!raced || attempt === SOA_ATTEMPTS) throw err;
       const answers = await withConn((c) =>
-        query(c, apex, TYPE_SOA, s.tsigKey),
+        query(c, apex, TYPES.SOA, s.tsigKey),
       );
-      const soa = answers.find((rr) => rr.type === TYPE_SOA);
+      const soa = answers.find((rr) => rr.type === TYPES.SOA);
       if (!soa) throw new Error("the zone has no SOA record");
       current = { ttl: soa.ttl, rdata: soa.rdata };
     }
