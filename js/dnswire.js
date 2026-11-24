@@ -8,7 +8,6 @@ export const CLASS_IN = 1;
 export const CLASS_NONE = 254;
 export const CLASS_ANY = 255;
 
-export const OPCODE_QUERY = 0;
 export const OPCODE_UPDATE = 5;
 
 export const TYPES = {
@@ -188,11 +187,24 @@ export function readName(msg, off) {
   return [labels.length ? labels.join(".") + "." : ".", end];
 }
 
-export function buildQuery(id, qname, qtype, qclass = CLASS_IN) {
+export function buildQuery(id, qname, qtype) {
   const w = new Writer(64);
   w.u16(id).u16(0).u16(1).u16(0).u16(0).u16(0);
-  w.name(qname).u16(qtype).u16(qclass);
+  w.name(qname).u16(qtype).u16(CLASS_IN);
   return w.done();
+}
+
+// A copy of message `msg` with a record appended, counted in section
+// `section` (1 answer, 2 authority, 3 additional; it must be the last
+// section with records).
+export function appendRecord(msg, section, name, type, cls, ttl, rdata) {
+  const w = new Writer(msg.length + rdata.length + 64);
+  w.bytes(msg).name(name).u16(type).u16(cls).u32(ttl);
+  const out = w.u16(rdata.length).bytes(rdata).done();
+  const count = ((out[4 + 2 * section] << 8) | out[5 + 2 * section]) + 1;
+  out[4 + 2 * section] = count >> 8;
+  out[5 + 2 * section] = count & 0xff;
+  return out;
 }
 
 // Layout of the rdata of types that may carry compressed names in received
@@ -288,7 +300,6 @@ export function parseMessage(msg) {
 
   return {
     id,
-    flags,
     opcode: (flags >>> 11) & 0xf,
     rcode: flags & 0xf,
     questions,

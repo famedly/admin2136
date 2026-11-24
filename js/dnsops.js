@@ -7,6 +7,7 @@
 
 import {
   Writer,
+  appendRecord,
   buildQuery,
   parseMessage,
   TYPES,
@@ -186,12 +187,8 @@ export function serialGt(a, b) {
 // IXFR query (RFC 1995 Section 3): the client's current SOA goes into the
 // authority section.
 export function buildIxfrQuery(id, zone, soa) {
-  const w = new Writer(128);
-  w.u16(id).u16(0).u16(1).u16(0).u16(1).u16(0);
-  w.name(zone).u16(TYPES.IXFR).u16(CLASS_IN);
-  w.name(zone).u16(TYPES.SOA).u16(CLASS_IN).u32(soa.ttl);
-  w.u16(soa.rdata.length).bytes(soa.rdata);
-  return w.done();
+  const q = buildQuery(id, zone, TYPES.IXFR);
+  return appendRecord(q, 2, zone, TYPES.SOA, CLASS_IN, soa.ttl, soa.rdata);
 }
 
 // Request an incremental zone transfer (RFC 1995) relative to `soa`, the
@@ -304,7 +301,8 @@ export async function query(
   const id = randId();
   const tsig = tsigKey ? new TsigSession(tsigKey) : null;
   let msg = buildQuery(id, qname, qtype);
-  if (edns) msg = withOpt(msg);
+  // An empty OPT record (RFC 6891): UDP payload size 1232.
+  if (edns) msg = appendRecord(msg, 3, ".", TYPES.OPT, 1232, 0, new Uint8Array(0));
   if (tsig) msg = await tsig.sign(msg);
   conn.send(msg);
   for (;;) {
@@ -315,15 +313,6 @@ export async function query(
     if (tsig) await tsig.verify(raw);
     return resp.answers;
   }
-}
-
-// Append an empty OPT record (UDP payload size 1232) to message `msg`.
-function withOpt(msg) {
-  const w = new Writer(msg.length + 11);
-  w.bytes(msg).u8(0).u16(TYPES.OPT).u16(1232).u32(0).u16(0);
-  const out = w.done();
-  out[11] += 1; // ARCOUNT (queries have no other additional records)
-  return out;
 }
 
 // The Extended DNS Error codes (RFC 8914) of a parsed response.

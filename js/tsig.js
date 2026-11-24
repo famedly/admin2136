@@ -10,7 +10,14 @@
 // MAC so every received message is authenticated (RFC 8945 Section 5.3.1
 // and 5.4).
 
-import { Writer, nameToWire, readName, TYPES, CLASS_ANY } from "./dnswire.js";
+import {
+  Writer,
+  appendRecord,
+  nameToWire,
+  readName,
+  TYPES,
+  CLASS_ANY,
+} from "./dnswire.js";
 
 const ALGORITHMS = {
   "hmac-sha1": "SHA-1",
@@ -108,16 +115,7 @@ async function signWithMac(msg, key) {
   rd.u16(0).u16(0); // error, other-len
   const rdata = rd.done();
 
-  const out = new Writer(msg.length + keyWire.length + rdata.length + 10);
-  out.bytes(msg);
-  out.bytes(keyWire).u16(TYPES.TSIG).u16(CLASS_ANY).u32(0);
-  out.u16(rdata.length).bytes(rdata);
-  const signed = out.done();
-
-  // Bump ARCOUNT.
-  const arcount = ((signed[10] << 8) | signed[11]) + 1;
-  signed[10] = (arcount >>> 8) & 0xff;
-  signed[11] = arcount & 0xff;
+  const signed = appendRecord(msg, 3, key.name, TYPES.TSIG, CLASS_ANY, 0, rdata);
   return { signed, mac };
 }
 
