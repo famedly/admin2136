@@ -21,6 +21,32 @@
         "type": "github"
       }
     },
+    "dows": {
+      "inputs": {
+        "famedly-engineering-standards": [
+          "famedly-engineering-standards"
+        ],
+        "flake-parts": [
+          "flake-parts"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1787245985,
+        "narHash": "sha256-E6NCGoNjeY41q6HmliTFJv9wTVbhBz6vSwR6QnOq7cY=",
+        "owner": "famedly",
+        "repo": "dows",
+        "rev": "61513e21722dc45e822f02bd56ec0919ff1d7276",
+        "type": "github"
+      },
+      "original": {
+        "owner": "famedly",
+        "repo": "dows",
+        "type": "github"
+      }
+    },
     "famedly-engineering-standards": {
       "inputs": {
         "devshell": "devshell",
@@ -118,6 +144,7 @@
     },
     "root": {
       "inputs": {
+        "dows": "dows",
         "famedly-engineering-standards": "famedly-engineering-standards",
         "flake-parts": [
           "famedly-engineering-standards",

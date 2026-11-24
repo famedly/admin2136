@@ -10,6 +10,14 @@
 
     nixpkgs.follows = "famedly-engineering-standards/nixpkgs";
     flake-parts.follows = "famedly-engineering-standards/flake-parts";
+
+    # DNS over WebSocket proxy, for the end-to-end tests.
+    dows = {
+      url = "github:famedly/dows";
+      inputs.famedly-engineering-standards.follows = "famedly-engineering-standards";
+      inputs.flake-parts.follows = "flake-parts";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -19,6 +27,7 @@
         famedly-engineering-standards.flakeModules.default
 
         ./nix/package.nix
+        ./nix/e2e.nix
         ./nix/workflows/build.nix
         ./nix/workflows/tests.nix
       ];

@@ -40,5 +40,23 @@ in
         }
       ];
     };
+
+    # Headless Chromium against Knot DNS (with an interpreted catalog zone)
+    # through dows; also runs the smoke tests to report the coverage of
+    # both together.
+    jobs.e2e = {
+      runsOn = "ubuntu-latest";
+
+      steps = [
+        { uses = allowed-actions."actions/checkout".uses; }
+        { uses = allowed-actions."cachix/install-nix-action".uses; }
+
+        {
+          name = "Run end-to-end tests and report coverage";
+          shell = "nix develop .#e2e --command bash {0}";
+          run = "node test/coverage.mjs --details";
+        }
+      ];
+    };
   };
 }

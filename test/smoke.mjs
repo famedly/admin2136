@@ -24,7 +24,12 @@ import {
   CLASS_ANY,
   CLASS_NONE,
 } from "../js/dnswire.js";
-import { parseTsigSpec, signMessage, TsigSession } from "../js/tsig.js";
+import {
+  parseTsigSpec,
+  signMessage,
+  TsigSession,
+  tsigErrorName,
+} from "../js/tsig.js";
 import {
   buildUpdateMessage,
   IGNORED_RRTYPES,
@@ -34,8 +39,12 @@ import {
   axfr,
   serialGt,
   buildIxfrQuery,
+  sendUpdate,
+  query,
+  rcodeName,
 } from "../js/dnsops.js";
 import { ZoneStore } from "../js/zonestore.js";
+import { DowsConnection } from "../js/dows.js";
 import {
   parseCatalog,
   newMemberId,
@@ -52,6 +61,8 @@ import {
   parseTxt,
   genericToText,
   parseGeneric,
+  decodeString,
+  tokenize,
   soaSerial,
   isEditableType,
   typeHint,
@@ -735,6 +746,17 @@ check(
       () => s.verify(stale),
       "time out of range",
     );
+    // a correctly signed response reporting a TSIG error
+    const s2 = new TsigSession(key);
+    await s2.sign(buildQuery(7, "example.com.", TYPE_SOA));
+    const signedError = await serverSign(mkResp(), s2.requestMac, {
+      error: 18,
+    });
+    await throws(
+      "tsig verify reports signed TSIG errors",
+      () => s2.verify(signedError),
+      "server reported TSIG error: BADTIME",
+    );
   }
 }
 
@@ -778,6 +800,914 @@ check(
     "a.www/A/300",
     "b.www/A/300",
   ]);
+}
+
+// --- parser and TSIG error branches ---
+{
+  const throws = (what, fn, substr) => {
+    try {
+      fn();
+      check(what + " (throws)", false);
+    } catch (e) {
+      check(
+        what + ' ("' + e.message + '" contains "' + substr + '")',
+        e.message.includes(substr),
+      );
+    }
+  };
+  const T = (name) => nameToType(name);
+  throws("dangling backslash", () => decodeString("a\\"), "dangling");
+  throws("\\DDD above 255", () => decodeString("\\999"), "\\DDD");
+  throws("short \\DDD", () => decodeString("\\12x"), "\\DDD");
+  eq("surrogate pair", hex(decodeString("😀")), "f09f9880");
+  throws(
+    "SvcParam without value",
+    () => textToRdata(T("SVCB"), "1 . alpn"),
+    "requires a value",
+  );
+  throws(
+    "empty ALPN id",
+    () => textToRdata(T("SVCB"), '1 . alpn=",h2"'),
+    "1-255",
+  );
+  throws(
+    "SvcParam value too long",
+    () => textToRdata(T("SVCB"), "1 . key9=" + "a".repeat(70000)),
+    "too long",
+  );
+  eq(
+    "generic SvcParam without value",
+    rdataToText(T("SVCB"), textToRdata(T("SVCB"), "1 . key667")),
+    "1 . key667",
+  );
+  throws("empty IPv6", () => parseIpv6(""), "empty IPv6");
+  throws("IPv6 with two ::", () => parseIpv6("1::2::3"), "invalid IPv6");
+  throws("IPv6 bad group", () => parseIpv6("g::1"), "invalid IPv6");
+  throws(
+    "IPv6 too long with ::",
+    () => parseIpv6("1:2:3:4:5:6:7::8"),
+    "invalid IPv6",
+  );
+  throws("IPv6 too short", () => parseIpv6("1:2:3"), "invalid IPv6");
+  eq(
+    "names absolute by default",
+    readName(textToRdata(T("NS"), "ns.example"), 0)[0],
+    "ns.example.",
+  );
+  throws(
+    "character-string too long",
+    () => textToRdata(T("HINFO"), '"' + "x".repeat(256) + '" os'),
+    "exceeds 255",
+  );
+  throws(
+    "salt too long",
+    () => textToRdata(T("NSEC3PARAM"), "1 0 0 " + "ab".repeat(256)),
+    "salt exceeds",
+  );
+  throws(
+    "malformed generic rdata",
+    () => parseGeneric("\\# x"),
+    "invalid generic",
+  );
+  throws("generic length mismatch", () => parseGeneric("\\# 2 aa"), "mismatch");
+
+  // TSIG error codes in TSIG rdata
+  const tsigRdata = (error) => {
+    const w = new Writer();
+    w.name("hmac-sha256.").u48(0).u16(300).u16(0); // no MAC
+    w.u16(1).u16(error).u16(0);
+    return w.done();
+  };
+  eq("TSIG error name", tsigErrorName(tsigRdata(17)), "BADKEY");
+  eq("unknown TSIG error", tsigErrorName(tsigRdata(99)), "TSIG error 99");
+  eq("no TSIG error", tsigErrorName(tsigRdata(0)), null);
+  eq("malformed TSIG rdata", tsigErrorName(Uint8Array.of(5)), null);
+}
+
+// --- edge and error branches ---
+{
+  const throws = async (what, fn, substr) => {
+    try {
+      await fn();
+      check(what + " (throws)", false);
+    } catch (e) {
+      check(
+        what + ' ("' + e.message + '" contains "' + substr + '")',
+        e.message.includes(substr),
+      );
+    }
+  };
+  const T = (name) => nameToType(name);
+  const Z = "example.com.";
+
+  // dnswire
+  eq("unknown type mnemonic", nameToType("NOPE"), null);
+  eq("rcode name fallback", rcodeName(42), "RCODE42");
+  await throws(
+    "label too long",
+    () => nameToWire("x".repeat(64) + ".com."),
+    "63 bytes",
+  );
+  await throws(
+    "name too long",
+    () => nameToWire(Array(9).fill("x".repeat(30)).join(".")),
+    "255 bytes",
+  );
+  await throws("empty label", () => nameToWire("a..b"), "empty label");
+  await throws(
+    "extended label type",
+    () => readName(Uint8Array.of(0x40, 0), 0),
+    "label type",
+  );
+  await throws(
+    "truncated name",
+    () => readName(Uint8Array.of(3, 0x61), 0),
+    "truncated",
+  );
+  await throws(
+    "truncated pointer",
+    () => readName(Uint8Array.of(0xc0), 0),
+    "pointer",
+  );
+  await throws(
+    "pointer loop",
+    () => readName(Uint8Array.of(0xc0, 0), 0),
+    "loop",
+  );
+  await throws(
+    "short message",
+    () => parseMessage(new Uint8Array(5)),
+    "shorter than header",
+  );
+  {
+    const w = new Writer();
+    w.u16(1).u16(0).u16(1).u16(0).u16(0).u16(0).name(Z).u8(0);
+    await throws(
+      "truncated question",
+      () => parseMessage(w.done()),
+      "truncated question",
+    );
+  }
+  const msgWith = (type, rdata, rdlen = rdata.length, extra = []) => {
+    const w = new Writer();
+    w.u16(1).u16(0x8000).u16(0).u16(1).u16(0).u16(0);
+    w.name(Z).u16(type).u16(1).u32(0).u16(rdlen).bytes(rdata).bytes(extra);
+    return w.done();
+  };
+  await throws(
+    "truncated RR",
+    () => parseMessage(msgWith(1, []).subarray(0, 30)),
+    "truncated resource record",
+  );
+  await throws(
+    "truncated rdata",
+    () => parseMessage(msgWith(1, [1, 2], 4)),
+    "truncated rdata",
+  );
+  await throws(
+    "MX without name",
+    () => parseMessage(msgWith(T("MX"), [0, 1])),
+    "truncated",
+  );
+  await throws(
+    "NAPTR string past rdata",
+    () =>
+      parseMessage(
+        msgWith(T("NAPTR"), [0, 1, 0, 1, 9], 5, [1, 1, 1, 1, 1, 1, 1, 1, 1]),
+      ),
+    "truncated rdata",
+  );
+  await throws(
+    "SRV name past rdata",
+    () =>
+      parseMessage(
+        msgWith(T("SRV"), [0, 0, 0, 0, 0, 0, 3, 0x61], 7, [0x62, 0x63, 0]),
+      ),
+    "truncated rdata",
+  );
+  {
+    const w = new Writer(2);
+    w.bytes(new Uint8Array(100));
+    eq("writer grows by more than double", w.done().length, 100);
+  }
+
+  // rdata
+  eq(
+    "generic for malformed TXT",
+    rdataToText(T("TXT"), Uint8Array.of(5, 0x61)).startsWith("\\#"),
+    true,
+  );
+  eq("empty TXT", rdataToText(T("TXT"), new Uint8Array(0)), '""');
+  eq(
+    "generic for trailing rdata",
+    rdataToText(T("A"), new Uint8Array(5)),
+    "\\# 5 0000000000",
+  );
+  eq("empty generic", genericToText(new Uint8Array(0)), "\\# 0");
+  eq("short SOA serial", soaSerial(Uint8Array.of(0, 0, 1)), null);
+  eq("hint for unknown types", typeHint(999), "\\# <length> <hex>");
+  eq(
+    "generic input for known types",
+    hex(textToRdata(T("A"), "\\# 4 c0000201")),
+    "c0000201",
+  );
+  await throws(
+    "unsupported type",
+    () => textToRdata(999, "x"),
+    "not supported",
+  );
+  await throws("bad IPv4", () => textToRdata(T("A"), "1.2.3"), "invalid IPv4");
+  await throws(
+    "IPv4 octet",
+    () => textToRdata(T("A"), "1.2.3.256"),
+    "invalid IPv4",
+  );
+  eq(
+    "IPv6 without long zero run",
+    formatIpv6(parseIpv6("1:0:2:0:3:0:4:0")),
+    "1:0:2:0:3:0:4:0",
+  );
+  eq(
+    "TXT escapes",
+    rdataToText(T("TXT"), Uint8Array.of(2, 7, 0xff)),
+    '"\\007\\255"',
+  );
+  await throws(
+    "TXT text after strings",
+    () => parseTxt('"a" b'),
+    "opening quote",
+  );
+  await throws("unterminated TXT", () => parseTxt('"abc'), "unterminated");
+  await throws(
+    "TXT string too long",
+    () => parseTxt('"' + "x".repeat(256) + '"'),
+    "exceeds 255",
+  );
+  await throws("TXT dangling backslash", () => parseTxt('"a\\'), "dangling");
+  eq("TXT \\DDD", hex(parseTxt('"\\065"')), "0141");
+  await throws("TXT bad \\DDD", () => parseTxt('"\\06"'), "\\DDD");
+  eq("empty TXT input", hex(parseTxt("")), "00");
+  eq("empty quoted TXT", hex(parseTxt('"" ')), "00");
+  eq(
+    "CAA bad tag shown generic",
+    rdataToText(T("CAA"), Uint8Array.of(0, 2, 0x2d, 0x2d)).startsWith("\\#"),
+    true,
+  );
+  eq(
+    "empty hex shown generic",
+    rdataToText(T("SSHFP"), Uint8Array.of(1, 1)).startsWith("\\#"),
+    true,
+  );
+  await throws(
+    "empty hex",
+    () => textToRdata(T("SSHFP"), "1 1"),
+    "must not be empty",
+  );
+  eq(
+    "short SOA shown generic",
+    rdataToText(T("SOA"), Uint8Array.of(0, 0, 1)).startsWith("\\#"),
+    true,
+  );
+  await throws(
+    "SOA fields of short rdata",
+    () => soaFields(Uint8Array.of(0, 0, 1)),
+    "short rdata",
+  );
+  await throws(
+    "SOA fields with trailing data",
+    () =>
+      soaFields(Uint8Array.of(...textToRdata(T("SOA"), ". . 1 2 3 4 5"), 9)),
+    "malformed SOA",
+  );
+  for (const [what, wire] of [
+    ["SvcParam port length", [0, 3, 0, 1, 5]],
+    ["SvcParam flag with value", [0, 2, 0, 1, 5]],
+    ["SvcParam empty ipv4hint", [0, 4, 0, 0]],
+  ]) {
+    eq(
+      what + " shown generic",
+      rdataToText(T("SVCB"), Uint8Array.of(0, 1, 0, ...wire)).startsWith("\\#"),
+      true,
+    );
+  }
+  eq(
+    "non-printable SvcParam",
+    rdataToText(T("SVCB"), Uint8Array.of(0, 1, 0, 0, 9, 0, 1, 7)),
+    '1 . key9="\\007"',
+  );
+  await throws("dangling backslash token", () => tokenize("a\\"), "dangling");
+  eq("escaped token", tokenize("a\\ b c"), ["a\\ b", "c"]);
+  eq(
+    "NSEC3PARAM empty salt",
+    rdataToText(T("NSEC3PARAM"), textToRdata(T("NSEC3PARAM"), "1 0 0 -")),
+    "1 0 0 -",
+  );
+
+  // tsig
+  await throws(
+    "TSIG spec without parts",
+    () => parseTsigSpec("a:b"),
+    "must be given",
+  );
+  await throws(
+    "TSIG empty key name",
+    () => parseTsigSpec("hmac-sha256: :AAAA"),
+    "key name is empty",
+  );
+  await throws(
+    "TSIG unknown algorithm",
+    () => parseTsigSpec("hmac-md5:k:AAAA"),
+    "unsupported TSIG algorithm",
+  );
+  await throws(
+    "TSIG bad base64",
+    () => parseTsigSpec("hmac-sha256:k:!!!"),
+    "not valid base64",
+  );
+  await throws(
+    "TSIG empty secret",
+    () => parseTsigSpec("hmac-sha256:k:"),
+    "secret is empty",
+  );
+  eq(
+    "TSIG key name normalized",
+    parseTsigSpec("HMAC-SHA1:Key.Name.:" + btoa("s")).name,
+    "key.name",
+  );
+  {
+    const key = parseTsigSpec("hmac-sha256:k:" + btoa("secret"));
+    const s = new TsigSession(key);
+    await throws(
+      "verify before sign",
+      () => s.verify(new Uint8Array(12)),
+      "before sign",
+    );
+    await s.sign(buildQuery(5, Z, T("SOA")));
+    await throws(
+      "verify short message",
+      () => s.verify(new Uint8Array(5)),
+      "shorter than header",
+    );
+    // messages with a broken TSIG RR
+    const withTsig = (build, arcount = 1, extraCount = 0) => {
+      const w = new Writer();
+      w.u16(5)
+        .u16(0x8000)
+        .u16(0)
+        .u16(0)
+        .u16(0)
+        .u16(arcount + extraCount);
+      build(w);
+      return w.done();
+    };
+    const tsigRR = (w, rdata, owner = "k.", cls = 255, ttl = 0) =>
+      w.name(owner).u16(250).u16(cls).u32(ttl).u16(rdata.length).bytes(rdata);
+    const rd = ({
+      alg = "hmac-sha256.",
+      mac = new Uint8Array(32),
+      error = 0,
+      other = [],
+    } = {}) => {
+      const w = new Writer();
+      w.name(alg)
+        .u48(Math.floor(Date.now() / 1000))
+        .u16(300)
+        .u16(mac.length)
+        .bytes(mac);
+      w.u16(5).u16(error).u16(other.length).bytes(other);
+      return w.done();
+    };
+    await throws(
+      "TSIG RR truncated",
+      () => s.verify(withTsig((w) => w.name("k.").u16(250))),
+      "truncated resource record",
+    );
+    await throws(
+      "TSIG rdata past end",
+      () =>
+        s.verify(
+          withTsig((w) => w.name("k.").u16(250).u16(255).u32(0).u16(50)),
+        ),
+      "truncated rdata",
+    );
+    await throws(
+      "two TSIG RRs (the first is not last)",
+      () =>
+        s.verify(
+          withTsig((w) => {
+            tsigRR(w, rd());
+            tsigRR(w, rd());
+          }, 2),
+        ),
+      "not the last",
+    );
+    await throws(
+      "TSIG not last",
+      () =>
+        s.verify(
+          withTsig((w) => {
+            tsigRR(w, rd());
+            w.name(".").u16(1).u16(1).u32(0).u16(4).u32(0);
+          }, 2),
+        ),
+      "not the last",
+    );
+    await throws(
+      "TSIG fixed fields truncated",
+      () => s.verify(withTsig((w) => tsigRR(w, nameToWire("hmac-sha256.")))),
+      "truncated TSIG rdata",
+    );
+    await throws(
+      "TSIG MAC truncated",
+      () =>
+        s.verify(
+          withTsig((w) => {
+            const r = rd();
+            tsigRR(w, r.subarray(0, r.length - 4));
+          }),
+        ),
+      "truncated TSIG rdata",
+    );
+    await throws(
+      "TSIG other data truncated",
+      () =>
+        s.verify(
+          withTsig((w) => {
+            const r = rd({ other: [1, 2] });
+            tsigRR(w, r.subarray(0, r.length - 1));
+          }),
+        ),
+      "truncated TSIG rdata",
+    );
+    await throws(
+      "TSIG unexpected algorithm",
+      () => s.verify(withTsig((w) => tsigRR(w, rd({ alg: "hmac-sha1." })))),
+      "unexpected algorithm",
+    );
+    await throws(
+      "TSIG class",
+      () => s.verify(withTsig((w) => tsigRR(w, rd(), "k.", 1))),
+      "class/TTL",
+    );
+    await throws(
+      "TSIG MAC too long",
+      () =>
+        s.verify(withTsig((w) => tsigRR(w, rd({ mac: new Uint8Array(40) })))),
+      "longer than",
+    );
+    await throws(
+      "TSIG MAC too short",
+      () =>
+        s.verify(withTsig((w) => tsigRR(w, rd({ mac: new Uint8Array(8) })))),
+      "shorter than allowed",
+    );
+    await throws(
+      "TSIG unknown error code",
+      () =>
+        s.verify(
+          withTsig((w) => tsigRR(w, rd({ mac: new Uint8Array(0), error: 99 }))),
+        ),
+      "TSIG error 99",
+    );
+    await throws(
+      "TSIG no error, no MAC",
+      () =>
+        s.verify(withTsig((w) => tsigRR(w, rd({ mac: new Uint8Array(0) })))),
+      "unsigned TSIG",
+    );
+    await throws(
+      "TSIG bad MAC with error",
+      () => s.verify(withTsig((w) => tsigRR(w, rd({ error: 16 })))),
+      "server reported BADSIG",
+    );
+  }
+
+  // dnsops over a fake connection: `script(query)` returns the replies
+  const fake = (script) => {
+    const conn = { queue: [] };
+    conn.send = (msg) => conn.queue.push(...script(msg));
+    conn.recv = async () => conn.queue.shift();
+    return conn;
+  };
+  const reply = (
+    q,
+    rrs,
+    { id = (q[0] << 8) | q[1], rcode = 0, qd = true } = {},
+  ) => {
+    const w = new Writer();
+    w.u16(id)
+      .u16(0x8400 | rcode)
+      .u16(qd ? 1 : 0)
+      .u16(rrs.length)
+      .u16(0)
+      .u16(0);
+    if (qd) w.name(Z).u16(T("SOA")).u16(1);
+    for (const r of rrs)
+      w.name(r.name)
+        .u16(r.type)
+        .u16(1)
+        .u32(r.ttl ?? 300)
+        .u16(r.rdata.length)
+        .bytes(r.rdata);
+    return w.done();
+  };
+  const soaRR = (serial) => ({
+    name: Z,
+    type: T("SOA"),
+    rdata: textToRdata(T("SOA"), `ns. h. ${serial} 1 2 3 4`),
+  });
+  const aRR = (n) => ({
+    name: "h" + n + "." + Z,
+    type: T("A"),
+    rdata: Uint8Array.of(10, 0, n >> 8, n & 255),
+  });
+  const stray = (q) => reply(q, [], { id: ((q[0] << 8) | q[1]) ^ 1 });
+
+  eq(
+    "query skips stray messages",
+    (
+      await query(
+        fake((q) => [stray(q), reply(q, [soaRR(7)])]),
+        Z,
+        T("SOA"),
+        null,
+      )
+    ).length,
+    1,
+  );
+  await throws(
+    "query error",
+    () =>
+      query(
+        fake((q) => [reply(q, [], { rcode: 5 })]),
+        Z,
+        T("SOA"),
+        null,
+      ),
+    "query failed: REFUSED",
+  );
+  await sendUpdate(
+    fake((q) => [stray(q), reply(q, [])]),
+    Z,
+    null,
+    [],
+  );
+  check("update skips stray messages", true);
+  eq(
+    "axfr skips stray messages",
+    await axfr(
+      fake((q) => [stray(q), reply(q, [soaRR(1), aRR(1), soaRR(1)])]),
+      Z,
+      null,
+      () => {},
+    ),
+    2,
+  );
+  await throws(
+    "axfr stalls",
+    () =>
+      axfr(
+        fake((q) => [reply(q, [soaRR(1)]), reply(q, [])]),
+        Z,
+        null,
+        () => {},
+      ),
+    "stalled",
+  );
+  await throws(
+    "axfr without SOA",
+    () =>
+      axfr(
+        fake((q) => [reply(q, [aRR(1)])]),
+        Z,
+        null,
+        () => {},
+      ),
+    "did not start with SOA",
+  );
+  await throws(
+    "ixfr without SOA",
+    () =>
+      ixfr(
+        fake((q) => [reply(q, [aRR(1)])]),
+        Z,
+        null,
+        { ttl: 0, rdata: soaRR(1).rdata },
+        () => {},
+      ),
+    "did not start with SOA",
+  );
+  {
+    // many changes: progress is reported every 1024 records
+    const adds = [];
+    for (let i = 0; i < 2100; i++) adds.push(aRR(i));
+    const progress = [];
+    const res = await ixfr(
+      fake((q) => [
+        reply(q, [soaRR(2), soaRR(1), soaRR(2), ...adds.slice(0, 1000)]),
+        reply(q, [...adds.slice(1000), soaRR(2)]),
+      ]),
+      Z,
+      null,
+      { ttl: 0, rdata: soaRR(1).rdata },
+      () => {},
+      (n) => progress.push(n),
+    );
+    eq("ixfr progress", progress, [1024, 2048]);
+    eq("ixfr many changes", res.changes.length, 2100);
+  }
+
+  // TSIG-signed streams: messages without TSIG in between, but the last
+  // one must be signed
+  {
+    const key = parseTsigSpec("hmac-sha256:k:" + btoa("stream-secret"));
+    const hmacKey = await crypto.subtle.importKey(
+      "raw",
+      key.secret,
+      { name: "HMAC", hash: "SHA-256" },
+      false,
+      ["sign"],
+    );
+    // server side signing (RFC 8945 5.3.1)
+    const signer = (request) => {
+      const q = parseMessage(request);
+      const reqTsig = q.additional[0].rdata;
+      const [, o] = readName(reqTsig, 0);
+      const macLen = (reqTsig[o + 8] << 8) | reqTsig[o + 9];
+      let prior = reqTsig.subarray(o + 10, o + 10 + macLen);
+      let first = true;
+      let pending = [];
+      return async (msg, sign = true) => {
+        if (!sign) {
+          pending.push(msg);
+          return msg;
+        }
+        const time = Math.floor(Date.now() / 1000);
+        const v = new Writer();
+        v.u16(prior.length).bytes(prior);
+        for (const p of pending) v.bytes(p);
+        v.bytes(msg);
+        if (first)
+          v.name("k.")
+            .u16(255)
+            .u32(0)
+            .name("hmac-sha256.")
+            .u48(time)
+            .u16(300)
+            .u16(0)
+            .u16(0);
+        else v.u48(time).u16(300);
+        const mac = new Uint8Array(
+          await crypto.subtle.sign("HMAC", hmacKey, v.done()),
+        );
+        first = false;
+        pending = [];
+        prior = mac;
+        const rd = new Writer();
+        rd.name("hmac-sha256.").u48(time).u16(300).u16(mac.length).bytes(mac);
+        rd.u16((msg[0] << 8) | msg[1])
+          .u16(0)
+          .u16(0);
+        const r = rd.done();
+        const out = new Writer();
+        out
+          .bytes(msg)
+          .name("k.")
+          .u16(250)
+          .u16(255)
+          .u32(0)
+          .u16(r.length)
+          .bytes(r);
+        const signed = out.done();
+        signed[11] += 1;
+        return signed;
+      };
+    };
+    const signedFake = (plan) => {
+      const conn = { queue: [] };
+      conn.send = (msg) => {
+        conn.pending = (async () => {
+          const sign = signer(msg);
+          for (const [rrs, signIt] of plan(msg))
+            conn.queue.push(await sign(rrs, signIt));
+        })();
+      };
+      conn.recv = async () => {
+        await conn.pending;
+        return conn.queue.shift();
+      };
+      return conn;
+    };
+    const n = await axfr(
+      signedFake((q) => [
+        [reply(q, [soaRR(1)]), true],
+        [reply(q, [aRR(1)]), false],
+        [reply(q, [soaRR(1)]), true],
+      ]),
+      Z,
+      key,
+      () => {},
+    );
+    eq("signed stream with an unsigned message", n, 2);
+    await throws(
+      "signed stream ending unsigned",
+      () =>
+        axfr(
+          signedFake((q) => [
+            [reply(q, [soaRR(1)]), true],
+            [reply(q, [aRR(1), soaRR(1)]), false],
+          ]),
+          Z,
+          key,
+          () => {},
+        ),
+      "unsigned message",
+    );
+    const many = (q) => [
+      [reply(q, [soaRR(1)]), true],
+      ...Array.from({ length: 100 }, (_, i) => [reply(q, [aRR(i)]), false]),
+      [reply(q, [soaRR(1)]), true],
+    ];
+    await throws(
+      "more than 99 unsigned messages",
+      () => axfr(signedFake(many), Z, key, () => {}),
+      "more than 99",
+    );
+  }
+
+  // zonestore
+  {
+    const root = new ZoneStore(".");
+    eq(
+      "root zone",
+      [root.zoneFqdn, root.relativize("."), root.absolutize("www")],
+      [".", "", "www.."],
+    );
+    const st = new ZoneStore("example.com");
+    await throws(
+      "name too long",
+      () => st.add("x".repeat(256), 1, 0, new Uint8Array(0)),
+      "name too long",
+    );
+    await throws(
+      "rdata too long",
+      () => st.add("x", 1, 0, new Uint8Array(70000)),
+      "rdata too long",
+    );
+    await throws("get out of range", () => st.get(0), "out of range");
+    await throws(
+      "replace out of range",
+      () => st.replace(0, "", 1, 0, new Uint8Array(0)),
+      "out of range",
+    );
+    await throws("remove out of range", () => st.remove(0), "out of range");
+    eq("revert without snapshot", st.revertToSynced(), false);
+    st.add("B", T("A"), 0, Uint8Array.of(1, 2, 3, 4));
+    st.add("a", T("A"), 0, Uint8Array.of(1, 2, 3, 4));
+    st.add("other.net.", T("A"), 0, Uint8Array.of(1, 2, 3, 4));
+    st.add("b", T("A"), 0, Uint8Array.of(1, 2, 3, 4));
+    st.add("x", T("A"), 0, new Uint8Array(200000 >> 4)); // grow the arena past double
+    const order = [0, 1, 2, 3].sort((x, y) => st.compareRecords(x, y));
+    eq(
+      "case-insensitive order, absolute names",
+      order.map((i) => st.get(i).name),
+      ["a", "B", "b", "other.net."],
+    );
+    // compaction while applying changes
+    const big = new ZoneStore("example.com");
+    big.add("", T("SOA"), 0, soaRR(1).rdata);
+    big.serial = 1;
+    big.syncSoa = { ttl: 0, rdata: soaRR(1).rdata };
+    big.markSynced();
+    for (let i = 0; i < 20000; i++)
+      big.replace(0, "", T("SOA"), 0, soaRR(1).rdata);
+    const bloated = big.arenaLen;
+    big.revertToSynced();
+    eq(
+      "apply with compaction",
+      big.applyChanges([{ op: "add", rr: aRR(1) }], soaRR(2)),
+      true,
+    );
+    check("arena compacted", big.arenaLen < bloated / 10);
+  }
+
+  // catalog
+  {
+    const st = new ZoneStore("catalog.invalid");
+    st.add("version", T("TXT"), 0, parseTxt('"2"'));
+    st.add("bad.zones", T("PTR"), 0, Uint8Array.of(5, 0x61)); // malformed
+    st.add("a.zones", T("PTR"), 0, nameToWire("same.example."));
+    st.add("b.zones", T("PTR"), 0, nameToWire("same.example."));
+    eq(
+      "malformed member PTR skipped, equal zones kept",
+      parseCatalog(st).members.map((m) => m.id),
+      ["a", "b"],
+    );
+  }
+}
+
+// --- remaining edge branches ---
+{
+  const T = (name) => nameToType(name);
+  let threw = null;
+  try {
+    const w = new Writer();
+    w.u16(1).u16(0x8000).u16(0).u16(1).u16(0).u16(0);
+    w.name("example.com.").u16(T("NAPTR")).u16(1).u32(0).u16(4).u32(0x00010001);
+    parseMessage(w.done());
+  } catch (e) {
+    threw = e.message;
+  }
+  eq("NAPTR without strings", threw, "truncated rdata");
+  eq("token starting with an escape", tokenize("\\a b"), ["\\a", "b"]);
+  eq("TXT with trailing blanks", hex(parseTxt('"a"   ')), "0161");
+  threw = null;
+  try {
+    parseTxt('"\\300"');
+  } catch (e) {
+    threw = e.message;
+  }
+  eq("TXT \\DDD above 255", threw, "invalid \\DDD escape in TXT data");
+  const st = new ZoneStore("example.com");
+  st._growArena(1 << 20); // more than double the initial size at once
+  check("arena grows by several doublings", st.arena.length >= 1 << 20);
+}
+
+// --- DoWS connection (with a fake WebSocket) ---
+{
+  const realWebSocket = globalThis.WebSocket;
+  const realWarn = console.warn;
+  const realLog = console.log;
+  class FakeWebSocket {
+    constructor(url) {
+      if (url.startsWith("ws://invalid")) throw new SyntaxError("invalid URL");
+      this.url = url;
+      this.sent = [];
+      setTimeout(() => {
+        if (url.startsWith("ws://refused"))
+          this.onclose({ code: 1006, reason: "" });
+        else this.onopen();
+      }, 0);
+    }
+    send(b) {
+      this.sent.push(b);
+    }
+    close() {
+      this.onclose({ code: 1000, reason: "bye" });
+    }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  console.warn = console.log = () => {};
+  try {
+    const frame = (...b) => ({ data: Uint8Array.from(b).buffer });
+    const c = new DowsConnection("ws://proxy//", "192.0.2.1:53");
+    eq("dows URL", c.url, "ws://proxy/192.0.2.1%3A53");
+    eq("not connected before open", c.connected, false);
+    await c.connect();
+    eq("connected", c.connected, true);
+    c.send(Uint8Array.of(1));
+    eq("frame sent", c.ws.sent.length, 1);
+    c.ws.onmessage({ data: "text" }); // ignored
+    c.ws.onmessage(frame(1, 2)); // nobody waiting: queued
+    eq("queued frame", Array.from(await c.recv()), [1, 2]);
+    const waiting = c.recv();
+    c.ws.onmessage(frame(3));
+    eq("frame for a waiter", Array.from(await waiting), [3]);
+    let err = null;
+    await c.recv(10).catch((e) => (err = e.message));
+    eq("recv timeout", err, "timeout waiting for DNS response");
+    const pending = c.recv();
+    c.close();
+    err = null;
+    await pending.catch((e) => (err = e.message));
+    eq("waiter rejected on close", err, "connection closed (bye)");
+    err = null;
+    await c.recv().catch((e) => (err = e.message));
+    eq("recv after close", err, "connection closed (bye)");
+    err = null;
+    try {
+      c.send(Uint8Array.of(1));
+    } catch (e) {
+      err = e.message;
+    }
+    eq("send after close", err, "not connected");
+    c.close(); // no-op
+
+    err = null;
+    await new DowsConnection("ws://invalid/", "ns")
+      .connect()
+      .catch((e) => (err = e.message));
+    eq("invalid URL", err, 'invalid WebSocket URL "ws://invalid/ns"');
+    err = null;
+    await new DowsConnection("ws://refused/", "ns")
+      .connect()
+      .catch((e) => (err = e.message));
+    eq("connection refused", err, "could not connect to ws://refused/ns");
+  } finally {
+    globalThis.WebSocket = realWebSocket;
+    console.warn = realWarn;
+    console.log = realLog;
+  }
 }
 
 // --- DNS error responses ---

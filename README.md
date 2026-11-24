@@ -60,3 +60,22 @@ The DOM-independent modules are covered by smoke tests:
 ```console
 $ node test/smoke.mjs
 ```
+
+End-to-end tests drive the site in headless Chromium against Knot DNS through
+[dows](https://github.com/famedly/dows). Knot serves an interpreted catalog zone
+whose member zones are configured in three groups by what the catalog's TSIG key
+may do there (nothing, transfers only, or transfers and updates). A Knot test
+module (`test/e2e/knot/ignoreme.c`) silently drops the updates of names whose
+leftmost label is `ignore-me`, to check that the site shows the server's zone
+contents even then. The nix devshell `e2e` provides all of it:
+
+```console
+$ nix develop .#e2e --command node test/e2e/run.mjs
+```
+
+The coverage of both test suites together, with `--details` listing uncovered
+branches:
+
+```console
+$ nix develop .#e2e --command node test/coverage.mjs --details
+```
