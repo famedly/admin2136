@@ -93,3 +93,8 @@ branches:
 ```console
 $ nix develop .#e2e --command node test/coverage.mjs --details
 ```
+
+It also writes `coverage/lcov.info` (paths relative to the repository), which
+editors can show: in Zed, the
+[Coverage LSP](https://zed.dev/extensions/coverage-lsp) extension finds it in
+the workspace and highlights covered and uncovered lines (no branches).

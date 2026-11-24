@@ -8,6 +8,10 @@
 //   nix develop .#e2e --command node test/coverage.mjs [--details]
 //   node test/coverage.mjs --report DIR [--details]   (report only)
 //
+// Also writes the result as LCOV (paths relative to the repository) to
+// coverage/lcov.info, or the file given with --lcov FILE, for editors and
+// other tools.
+//
 // Coverage is computed from V8 block coverage, like c8 does: every block
 // range V8 reports (if/else arms, ternary and logical operator sides,
 // code after an early return, catch clauses, ...) counts as a branch. A
@@ -24,6 +28,10 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const args = process.argv.slice(2);
 const details = args.includes("--details");
 const reportIdx = args.indexOf("--report");
+const lcovIdx = args.indexOf("--lcov");
+const lcovFile = path.resolve(
+  lcovIdx >= 0 ? args[lcovIdx + 1] : path.join(root, "coverage/lcov.info"),
+);
 
 let dir;
 let failed = false;
@@ -171,6 +179,7 @@ for (const file of [...fs.readdirSync(path.join(root, "js"))].sort()) {
   let lines = 0;
   let linesHit = 0;
   const uncoveredLines = [];
+  const lineHits = []; // [line, 0 | 1] for LCOV
   let offset = 0;
   src.split("\n").forEach((line, n) => {
     let i = offset;
@@ -179,6 +188,7 @@ for (const file of [...fs.readdirSync(path.join(root, "js"))].sort()) {
       lines++;
       if (covered[i]) linesHit++;
       else uncoveredLines.push(n + 1);
+      lineHits.push([n + 1, covered[i]]);
     }
     offset += line.length + 1;
   });
@@ -198,6 +208,18 @@ for (const file of [...fs.readdirSync(path.join(root, "js"))].sort()) {
       .filter((f) => !f.hit)
       .map((f) => [lineOf(f.start), f.name]),
     uncoveredLines,
+    lineHits,
+    blockHits: [...blocks.values()]
+      .map((s) => firstCode(s))
+      .sort((a, b) => a - b)
+      .map((s) => [lineOf(s), covered[s]]),
+    // LCOV needs unique function names: add the line to repeated ones
+    // (e.g. the read() methods of the rdata field codecs).
+    functionHits: fns.map((f) => {
+      const line = lineOf(f.start);
+      const repeated = fns.filter((g) => g.name === f.name).length > 1;
+      return [line, repeated ? `${f.name}@${line}` : f.name, f.hit ? 1 : 0];
+    }),
   });
 }
 
@@ -241,7 +263,26 @@ if (details) {
       console.log(`  ${line}: ${text.slice(0, 100)}`);
   }
 }
+// LCOV, with paths relative to the repository (e.g. for editors).
+const lcov = [];
+for (const r of report) {
+  if (!r.hasData) continue;
+  lcov.push("TN:", "SF:" + r.file);
+  for (const [line, name] of r.functionHits) lcov.push(`FN:${line},${name}`);
+  for (const [, name, hit] of r.functionHits) lcov.push(`FNDA:${hit},${name}`);
+  lcov.push("FNF:" + r.functions[1], "FNH:" + r.functions[0]);
+  r.blockHits.forEach(([line, hit], i) =>
+    lcov.push(`BRDA:${line},${i},0,${hit}`),
+  );
+  lcov.push("BRF:" + r.branches[1], "BRH:" + r.branches[0]);
+  for (const [line, hit] of r.lineHits) lcov.push(`DA:${line},${hit}`);
+  lcov.push("LF:" + r.lines[1], "LH:" + r.lines[0], "end_of_record");
+}
+fs.mkdirSync(path.dirname(lcovFile), { recursive: true });
+fs.writeFileSync(lcovFile, lcov.join("\n") + "\n");
+
 console.log("\ncoverage data: " + dir);
+console.log("LCOV: " + path.relative(process.cwd(), lcovFile));
 if (failed) {
   console.error("tests failed");
   process.exitCode = 1;
