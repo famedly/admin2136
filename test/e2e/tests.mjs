@@ -1007,6 +1007,108 @@ test("big zone: virtual list scrolling and filter", async (t) => {
   );
 });
 
+// Widths of the header cells and of the cells of the first row of a list.
+const colWidths = (b, header, list) =>
+  b.ev(`const w = (el) => [...el.children].map((c) => Math.round(c.getBoundingClientRect().width));
+    return [w(document.getElementById(${JSON.stringify(header)})),
+      w(document.querySelector("#${list} .vlist-row"))];`);
+
+// Drag the resize handle of column `col` of a header by `dx` pixels with
+// real mouse events.
+async function dragColumn(b, header, col, dx, button = "left") {
+  const [x, y] = await b.ev(`
+    const h = document.querySelectorAll("#${header} .col-resize")[${col}];
+    const r = h.getBoundingClientRect();
+    return [r.x + r.width / 2, r.y + r.height / 2];`);
+  const mouse = (type, x, buttons) =>
+    b.send("Input.dispatchMouseEvent", {
+      type,
+      x,
+      y,
+      button,
+      buttons,
+      clickCount: 1,
+    });
+  const buttons = button === "left" ? 1 : 2;
+  await mouse("mouseMoved", x, 0);
+  await mouse("mousePressed", x, buttons);
+  await mouse("mouseMoved", x + dx / 2, buttons);
+  await mouse("mouseMoved", x + dx, buttons);
+  await mouse("mouseReleased", x + dx, 0);
+}
+
+test("columns: resize, clamp, persist and reset", async (t) => {
+  const { b } = t;
+  await t.login("full.example");
+  const [h0, r0] = await colWidths(b, "list-header", "record-list");
+  t.eq(r0, h0, "rows follow the header");
+
+  // widen the name column; the data column gives up the width
+  await dragColumn(b, "list-header", 0, 100);
+  const [h1, r1] = await colWidths(b, "list-header", "record-list");
+  t.eq(h1[0], h0[0] + 100, "name column wider");
+  t.eq(h1[3], h0[3] - 100, "data column narrower");
+  t.eq(r1, h1, "rows follow the resized header");
+
+  // only the left button resizes
+  await dragColumn(b, "list-header", 1, 50, "right");
+  await dragColumn(b, "list-header", 1, 0, "right");
+  t.eq((await colWidths(b, "list-header", "record-list"))[0], h1, "right drag");
+
+  // the data column keeps its minimum width, the others theirs
+  await dragColumn(b, "list-header", 2, 5000);
+  const [h2] = await colWidths(b, "list-header", "record-list");
+  t.eq(h2[3], 200, "data column at its minimum");
+  await dragColumn(b, "list-header", 1, -5000);
+  const [h3] = await colWidths(b, "list-header", "record-list");
+  t.eq(h3[1], 40, "TTL column at its minimum");
+
+  // kept across page loads
+  await t.login("full.example");
+  t.eq(
+    (await colWidths(b, "list-header", "record-list"))[0],
+    h3,
+    "widths restored",
+  );
+
+  // double-click restores the defaults
+  await b.ev(
+    `document.querySelector("#list-header .col-resize").dispatchEvent(new MouseEvent("dblclick"));`,
+  );
+  t.eq(
+    (await colWidths(b, "list-header", "record-list"))[0],
+    h0,
+    "widths reset",
+  );
+  t.eq(
+    await b.ev(`return localStorage.getItem("admin2136-record-cols");`),
+    null,
+    "reset widths not stored",
+  );
+
+  // stored garbage is ignored
+  await b.ev(`localStorage.setItem("admin2136-record-cols", "[1, 2]");
+    localStorage.setItem("admin2136-zone-cols", "{");`);
+  await t.login("catalog.test");
+  await soaShown(b);
+  const [z0, zr0] = await colWidths(b, "zone-header", "zone-list");
+  t.eq(zr0, z0, "catalog rows follow the header");
+
+  // the catalog view has its own widths
+  await dragColumn(b, "zone-header", 2, -60);
+  const [z1, zr1] = await colWidths(b, "zone-header", "zone-list");
+  t.eq(z1[2], z0[2] - 60, "SOA column narrower");
+  t.eq(z1[3], z0[3] + 60, "NS column wider");
+  t.eq(zr1, z1, "catalog rows follow the resized header");
+  await t.login("full.example");
+  t.eq(
+    (await colWidths(b, "list-header", "record-list"))[0],
+    h0,
+    "record columns unaffected",
+  );
+  await b.ev(`localStorage.removeItem("admin2136-zone-cols");`);
+});
+
 // ---- more branches ----
 
 test("catalog: rejected catalog updates, groupless members", async (t) => {

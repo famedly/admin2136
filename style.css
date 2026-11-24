@@ -242,7 +242,11 @@ a {
 
 .record-grid {
     display: grid;
-    grid-template-columns: minmax(140px, 1fr) 76px 96px minmax(200px, 3fr) 76px;
+    /* --record-cols is set when the user resizes the columns (colresize.js) */
+    grid-template-columns: var(
+        --record-cols,
+        minmax(140px, 1fr) 76px 96px minmax(200px, 3fr) 76px
+    );
     gap: 10px;
     align-items: center;
     padding: 0 14px;
@@ -251,9 +255,11 @@ a {
 /* Catalog zones list their member zones instead of the records. */
 .zone-grid {
     display: grid;
-    grid-template-columns:
+    grid-template-columns: var(
+        --zone-cols,
         minmax(150px, 2fr) minmax(70px, 1fr) minmax(220px, 3fr)
-        minmax(120px, 2fr) 76px;
+            minmax(120px, 2fr) 76px
+    );
     gap: 10px;
     align-items: center;
     padding: 0 14px;
@@ -283,6 +289,44 @@ a {
     color: var(--fg-dim);
     border-bottom: 1px solid var(--border);
     background: var(--bg-alt);
+}
+
+#list-header > span,
+#zone-header > span {
+    position: relative;
+    align-self: stretch;
+    line-height: 29px;
+    white-space: nowrap;
+}
+/* Column resize handle (colresize.js), covering the gap right of a
+   header cell. */
+.col-resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    right: -10px;
+    width: 10px;
+    cursor: col-resize;
+    touch-action: none;
+    z-index: 1;
+}
+.col-resize::after {
+    content: "";
+    position: absolute;
+    top: 7px;
+    bottom: 7px;
+    left: 4px;
+    width: 2px;
+    border-radius: 1px;
+    background: var(--border);
+}
+.col-resize:hover::after,
+.col-resize:active::after {
+    background: var(--accent);
+}
+.resizing {
+    cursor: col-resize;
+    user-select: none;
 }
 
 #record-list,

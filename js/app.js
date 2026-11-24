@@ -27,6 +27,7 @@ import { dsRdata, dsKeys } from "./dnssec.js";
 import { parseTsigSpec } from "./tsig.js";
 import { ZoneStore } from "./zonestore.js";
 import { VirtualList } from "./vlist.js";
+import { resizableColumns } from "./colresize.js";
 import {
   rdataToText,
   textToRdata,
@@ -523,6 +524,27 @@ function enterSession(s) {
   showSession(s);
   history.pushState({ view: "zone", depth: s.depth }, "");
 }
+
+// The columns before the data column (records) or the NS column (catalog
+// zones) can be resized; that column takes the remaining width.
+resizableColumns({
+  header: $("list-header"),
+  scope: $("zone-view"),
+  name: "--record-cols",
+  count: 3,
+  flexMin: 200,
+  tail: "76px",
+  storageKey: "admin2136-record-cols",
+});
+resizableColumns({
+  header: $("zone-header"),
+  scope: $("zone-view"),
+  name: "--zone-cols",
+  count: 3,
+  flexMin: 120,
+  tail: "76px",
+  storageKey: "admin2136-zone-cols",
+});
 
 // ---- record list ----
 
