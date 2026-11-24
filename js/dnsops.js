@@ -2,12 +2,8 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-// High-level DNS operations over a DoWS connection: AXFR and RFC 2136 UPDATE.
-//
-// TODO(IXFR): for incremental reloads, send an IXFR query (type 251) with the
-// current SOA in the authority section and apply the delta envelopes to the
-// ZoneStore instead of rebuilding it. The transport and TSIG layers already
-// support this; only the envelope interpretation is missing.
+// High-level DNS operations over a DoWS connection: AXFR, IXFR (RFC 1995)
+// and RFC 2136 UPDATE.
 
 import {
   Writer,
@@ -18,11 +14,13 @@ import {
   TYPE_NSEC,
   TYPE_NSEC3,
   TYPE_AXFR,
+  TYPE_IXFR,
   TYPE_TSIG,
   CLASS_IN,
   OPCODE_UPDATE,
 } from "./dnswire.js";
 import { TsigSession, tsigErrorName } from "./tsig.js";
+import { soaSerial } from "./rdata.js";
 
 const RCODES = {
   0: "NOERROR",
@@ -38,7 +36,9 @@ const RCODES = {
   10: "NOTZONE",
 };
 
+export const RCODE_FORMERR = 1;
 export const RCODE_SERVFAIL = 2;
+export const RCODE_NOTIMP = 4;
 const RCODE_REFUSED = 5;
 export const RCODE_NXRRSET = 8;
 const RCODE_NOTAUTH = 9;
@@ -86,121 +86,177 @@ export function isRejection(err) {
   );
 }
 
-// Stream a full zone transfer; `onRecord` is called for every record of the
-// zone exactly once (the trailing terminator SOA is suppressed).
-// Returns the number of records seen.
-export async function axfr(conn, zone, tsigKey, onRecord) {
-  const id = randId();
+// Send the (unsigned) query `msg` and read the transfer response stream
+// it triggers. `onRecord(rr)` is called for every answer record except
+// TSIG and IGNORED_RRTYPES, in order, and returns true once the record
+// ended the transfer. The whole stream is authenticated with `tsigKey`,
+// if given (RFC 8945 Section 5.3.1). `what` names the transfer in errors.
+async function streamTransfer(conn, msg, tsigKey, what, onRecord) {
+  const id = (msg[0] << 8) | msg[1];
   const tsig = tsigKey ? new TsigSession(tsigKey) : null;
-  let msg = buildQuery(id, zone, TYPE_AXFR);
   if (tsig) msg = await tsig.sign(msg);
   conn.send(msg);
-
+  const tag = "[" + what.toLowerCase() + "]";
   console.log(
-    "[axfr] query sent: id=" +
+    tag +
+      " query sent: id=" +
       id +
-      " zone=" +
-      zone +
       (tsigKey ? " (TSIG-signed)" : " (unsigned)"),
   );
 
-  let soaSeen = 0;
-  let count = 0;
+  let done = false;
   let frameNo = 0;
   let lastSigned = true;
-  while (soaSeen < 2) {
+  while (!done) {
     const raw = await conn.recv(120000);
     frameNo++;
     const resp = parseMessage(raw);
     console.log(
-      "[axfr] reply #" +
+      tag +
+        " reply #" +
         frameNo +
         ": " +
         raw.length +
-        " bytes," +
-        " id=" +
+        " bytes, id=" +
         resp.id +
         " (expected " +
         id +
-        ")," +
-        " rcode=" +
+        "), rcode=" +
         rcodeName(resp.rcode) +
-        "," +
-        " qd=" +
-        resp.questions.length +
-        " an=" +
-        resp.answers.length +
-        " ns=" +
-        resp.authority.length +
-        " ar=" +
-        resp.additional.length,
+        ", an=" +
+        resp.answers.length,
     );
     if (resp.id !== id) {
       // stray message; not ours -- keep waiting
-      console.warn(
-        "[axfr] reply #" +
-          frameNo +
-          " ignored due to ID mismatch; still waiting for id=" +
-          id,
-      );
+      console.warn(tag + " reply #" + frameNo + " ignored due to ID mismatch");
       continue;
     }
     if (resp.rcode !== 0) {
-      throw new DnsError("AXFR refused", resp);
+      throw new DnsError(what + " refused", resp);
     }
     if (tsig) {
       lastSigned = (await tsig.verify(raw)).signed;
       if (!lastSigned) {
-        console.log("[axfr] reply #" + frameNo + " carries no TSIG (deferred)");
+        console.log(tag + " reply #" + frameNo + " carries no TSIG (deferred)");
       }
     }
     let progressed = false;
-    let ignored = 0;
     for (const rr of resp.answers) {
       if (rr.type === TYPE_TSIG) continue;
-      if (IGNORED_RRTYPES.has(rr.type)) {
-        ignored++;
-        progressed = true; // consumed from the stream, just not stored
-        continue;
-      }
-      if (rr.type === TYPE_SOA) {
-        soaSeen++;
-        console.log(
-          "[axfr] reply #" +
-            frameNo +
-            ": SOA record (soaSeen=" +
-            soaSeen +
-            ")" +
-            (soaSeen === 2 ? " -> transfer complete" : ""),
-        );
-        if (soaSeen === 2) break; // terminator SOA, do not report again
-      } else if (soaSeen === 0) {
-        throw new Error("AXFR stream did not start with SOA");
-      }
-      onRecord(rr);
-      count++;
       progressed = true;
+      if (IGNORED_RRTYPES.has(rr.type)) continue; // consumed, not reported
+      if (onRecord(rr)) {
+        done = true;
+        break;
+      }
     }
-    console.log(
-      "[axfr] reply #" +
-        frameNo +
-        " processed: " +
-        count +
-        " records total, " +
-        ignored +
-        " ignored, soaSeen=" +
-        soaSeen,
-    );
-    if (!progressed && soaSeen < 2) {
-      throw new Error("AXFR stream stalled (empty response message)");
+    if (!progressed && !done) {
+      throw new Error(what + " stream stalled (empty response message)");
     }
   }
   // RFC 8945 5.3.1: the last message of the transfer must carry a TSIG.
   if (tsig && !lastSigned) {
-    throw new Error("AXFR ended with an unsigned message (missing TSIG)");
+    throw new Error(what + " ended with an unsigned message (missing TSIG)");
   }
-  console.log("[axfr] done: " + count + " records");
+  console.log(tag + " done after " + frameNo + " messages");
+}
+
+// Stream a full zone transfer; `onRecord` is called for every record of the
+// zone exactly once (the trailing terminator SOA is suppressed).
+// Returns the number of records seen.
+export async function axfr(conn, zone, tsigKey, onRecord) {
+  let count = 0;
+  const msg = buildQuery(randId(), zone, TYPE_AXFR);
+  await streamTransfer(conn, msg, tsigKey, "AXFR", (rr) => {
+    if (rr.type === TYPE_SOA && count > 0) return true; // terminator SOA
+    if (count === 0 && rr.type !== TYPE_SOA) {
+      throw new Error("AXFR stream did not start with SOA");
+    }
+    onRecord(rr);
+    count++;
+    return false;
+  });
   return count;
+}
+
+// RFC 1982 serial number arithmetic: whether serial `a` is newer than `b`.
+export function serialGt(a, b) {
+  const d = (a - b) >>> 0;
+  return d !== 0 && d < 0x80000000;
+}
+
+// IXFR query (RFC 1995 Section 3): the client's current SOA goes into the
+// authority section.
+export function buildIxfrQuery(id, zone, soa) {
+  const w = new Writer(128);
+  w.u16(id).u16(0).u16(1).u16(0).u16(1).u16(0);
+  w.name(zone).u16(TYPE_IXFR).u16(CLASS_IN);
+  w.name(zone).u16(TYPE_SOA).u16(CLASS_IN).u32(soa.ttl);
+  w.u16(soa.rdata.length).bytes(soa.rdata);
+  return w.done();
+}
+
+// Request an incremental zone transfer (RFC 1995) relative to `soa`, the
+// { ttl, rdata } of the SOA the client holds. Resolves to one of
+//   { kind: "uptodate", soa }  the client's version is current
+//   { kind: "incremental", soa, changes }
+//       `changes` lists { op: "del" | "add", rr } in order, without the
+//       SOA records that delimit the difference sequences
+//   { kind: "full", soa }  the server sent the whole zone instead (as an
+//       AXFR would); its records were passed to `onFullRecord` exactly
+//       like axfr() passes them to `onRecord`
+// where `soa` is the server's current SOA record. `onProgress(n)` is
+// called with the number of records received so far, every 1024 records.
+export async function ixfr(conn, zone, tsigKey, soa, onFullRecord, onProgress) {
+  const clientSerial = soaSerial(soa.rdata);
+  const result = { kind: null, soa: null, changes: [] };
+  let serverSerial = null;
+  let op = null; // "del" / "add" within an incremental response
+  let n = 0;
+  const msg = buildIxfrQuery(randId(), zone, soa);
+  await streamTransfer(conn, msg, tsigKey, "IXFR", (rr) => {
+    if (++n % 1024 === 0 && onProgress) onProgress(n);
+    const isSoa = rr.type === TYPE_SOA;
+    if (n === 1) {
+      if (!isSoa) throw new Error("IXFR stream did not start with SOA");
+      result.soa = rr;
+      serverSerial = soaSerial(rr.rdata);
+      if (!serialGt(serverSerial, clientSerial)) {
+        result.kind = "uptodate";
+        return true;
+      }
+      return false;
+    }
+    if (n === 2) {
+      // An incremental response continues with the SOA of the client's
+      // version, starting the first deletion sequence. Anything else is
+      // a full transfer -- except a second SOA of the current version,
+      // which ends the full transfer of a zone consisting of its SOA only.
+      if (isSoa && soaSerial(rr.rdata) !== serverSerial) {
+        result.kind = "incremental";
+        op = "del";
+        return false;
+      }
+      result.kind = "full";
+      onFullRecord(result.soa);
+      if (isSoa) return true;
+    }
+    if (result.kind === "full") {
+      if (isSoa) return true; // terminator SOA
+      onFullRecord(rr);
+      return false;
+    }
+    if (isSoa) {
+      // Every difference sequence is "SOA(old) deletions SOA(new)
+      // additions"; the current version's SOA after additions ends it all.
+      if (op === "add" && soaSerial(rr.rdata) === serverSerial) return true;
+      op = op === "del" ? "add" : "del";
+      return false;
+    }
+    result.changes.push({ op, rr });
+    return false;
+  });
+  return result;
 }
 
 // Build an RFC 2136 UPDATE message. `updates` and `prereqs` entries:

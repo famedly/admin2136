@@ -8,10 +8,13 @@
 import { DowsConnection } from "./dows.js";
 import {
   axfr,
+  ixfr,
   query,
   sendUpdate,
   isRejection,
   DnsError,
+  RCODE_FORMERR,
+  RCODE_NOTIMP,
   RCODE_NXRRSET,
 } from "./dnsops.js";
 import { parseTsigSpec } from "./tsig.js";
@@ -54,7 +57,10 @@ let connecting = null; // pending reconnect, see getConn()
 let settings = { proxy: "", ns: "" };
 let vlist = null; // VirtualList of records
 let zlist = null; // VirtualList of catalog member zones
-let editRec = null; // record index being edited, or null for "add"
+// The record being edited as returned by ZoneStore.get() (not its index: a
+// refresh may move or replace the records while the dialog is open; the
+// rdata view stays valid), or null for "add".
+let editOld = null;
 
 // One session per opened zone. The zone opened at login has depth 0, a
 // zone opened from a catalog one more than the catalog. A session's depth
@@ -280,7 +286,10 @@ async function transferZone(s, progress, c = null) {
   const run = (c) =>
     axfr(c, fresh.zoneFqdn, s.tsigKey, (rr) => {
       fresh.add(fresh.relativize(rr.name), rr.type, rr.ttl, rr.rdata);
-      if (rr.type === TYPE_SOA) fresh.serial = soaSerial(rr.rdata);
+      if (rr.type === TYPE_SOA) {
+        fresh.serial = soaSerial(rr.rdata);
+        fresh.syncSoa = { ttl: rr.ttl, rdata: rr.rdata };
+      }
       // Report the very first record immediately (it signals that the
       // server accepted the request), then every 1024 records. The serial
       // is known from the first record on, since an AXFR starts with the
@@ -288,6 +297,7 @@ async function transferZone(s, progress, c = null) {
       if (++n === 1 || (n & 1023) === 0) progress(n, fresh.serial);
     });
   await (c ? runOn(c, run) : withConn(run));
+  fresh.markSynced();
   s.store = fresh;
 }
 
@@ -605,9 +615,13 @@ async function deleteMember(m) {
     setStatus(s, "Removing " + m.zone + "…");
     const updates = deleteMemberUpdates(s.store, m);
     await performUpdate(s, updates);
-    // Remove from the highest index down, since removal shifts the
-    // indices of all later records.
-    for (const i of [...m.recs].sort((a, b) => b - a)) s.store.remove(i);
+    // A refresh during the update may have moved the records, or replaced
+    // s.store; find each deleted record again by its contents.
+    const store = s.store;
+    for (const u of updates) {
+      const i = store.indexOf(store.relativize(u.name), u.type, u.rdata);
+      if (i >= 0) store.remove(i);
+    }
     rebuild(s);
     setStatus(s, "Removed " + m.zone + " from the catalog.", "ok");
   } catch (err) {
@@ -800,26 +814,108 @@ window.addEventListener("popstate", (e) => {
 
 // ---- refresh ----
 
+// Bring the store of session `s` up to date with the server: incrementally
+// via IXFR (RFC 1995) from the version last transferred, else by a full
+// transfer. Returns a description of what happened.
+async function refreshZone(s, progress) {
+  const old = s.store;
+  const full = async (how) => {
+    await transferZone(s, progress);
+    return (
+      "Zone reloaded " +
+      how +
+      " (" +
+      s.store.count +
+      " records, serial " +
+      s.store.serial +
+      ")."
+    );
+  };
+  if (!old.syncSoa) return full("via AXFR");
+
+  const fresh = new ZoneStore(old.zone);
+  let res;
+  try {
+    res = await withConn((c) =>
+      ixfr(
+        c,
+        old.zoneFqdn,
+        s.tsigKey,
+        old.syncSoa,
+        (rr) => fresh.add(fresh.relativize(rr.name), rr.type, rr.ttl, rr.rdata),
+        progress,
+      ),
+    );
+  } catch (err) {
+    // Servers without IXFR support answer NOTIMP or FORMERR.
+    const unsupported =
+      err instanceof DnsError &&
+      (err.rcode === RCODE_NOTIMP || err.rcode === RCODE_FORMERR);
+    if (!unsupported) throw err;
+    return full("via AXFR, IXFR is not supported");
+  }
+
+  const from = soaSerial(old.syncSoa.rdata);
+  const to = soaSerial(res.soa.rdata);
+  switch (res.kind) {
+    case "uptodate":
+      // A server whose version is older than ours (e.g. after the zone
+      // was recreated) answers like this as well; only a full transfer
+      // gets us back in sync then.
+      if (to !== from) return full("via AXFR, server serial went back");
+      // Nothing changed on the server since the last transfer, so any
+      // local edit is one the server acknowledged but did not apply.
+      return old.revertToSynced()
+        ? "Zone is up to date (serial " +
+            to +
+            "); discarded local changes the server did not apply."
+        : "Zone is up to date (serial " + to + ").";
+    case "full":
+      fresh.serial = to;
+      fresh.syncSoa = { ttl: res.soa.ttl, rdata: res.soa.rdata };
+      fresh.markSynced();
+      s.store = fresh;
+      return (
+        "Zone reloaded, the server sent the full zone (" +
+        fresh.count +
+        " records, serial " +
+        to +
+        ")."
+      );
+    default: {
+      // The differences are applied to the zone contents of the last
+      // transfer, not to the locally edited store, see applyChanges().
+      if (!old.applyChanges(res.changes, res.soa)) {
+        return full("via AXFR, the IXFR did not match the last transfer");
+      }
+      const added = res.changes.filter((c) => c.op === "add").length;
+      const deleted = res.changes.length - added;
+      const records = (n) => n + (n === 1 ? " record" : " records");
+      return (
+        "Updated via IXFR (serial " +
+        from +
+        " → " +
+        to +
+        "): " +
+        (res.changes.length
+          ? records(added) + " added, " + records(deleted) + " deleted."
+          : "only the SOA changed.")
+      );
+    }
+  }
+}
+
 $("refresh-btn").addEventListener("click", async () => {
   const s = cur;
   const btn = $("refresh-btn");
   try {
     btn.disabled = true;
-    setStatus(s, "Reloading zone via AXFR…");
-    // TODO(IXFR): request an incremental transfer based on store.serial.
-    await transferZone(s, (n) =>
+    setStatus(s, "Reloading zone…");
+    const msg = await refreshZone(s, (n) =>
       setStatus(s, "Reloading zone… " + n + " records"),
     );
     rebuild(s);
-    setStatus(
-      s,
-      "Zone reloaded (" +
-        s.store.count +
-        " records, serial " +
-        (s.store.serial ?? "?") +
-        ").",
-      "ok",
-    );
+    setStatus(s, msg, "ok");
   } catch (err) {
     setStatus(s, "✗ reload failed: " + err.message, "error");
   } finally {
@@ -845,9 +941,9 @@ const soaOption = document.createElement("option");
 soaOption.textContent = "SOA";
 
 function openEditor(rec) {
-  editRec = rec;
+  editOld = rec === null ? null : cur.store.get(rec);
   $("edit-status").textContent = "";
-  const isSoa = rec !== null && cur.store.get(rec).type === TYPE_SOA;
+  const isSoa = editOld !== null && editOld.type === TYPE_SOA;
   if (isSoa) $("edit-type").appendChild(soaOption);
   else soaOption.remove();
   $("edit-name").disabled = isSoa;
@@ -859,7 +955,7 @@ function openEditor(rec) {
     $("edit-type").value = "A";
     $("edit-data").value = "";
   } else {
-    const r = cur.store.get(rec);
+    const r = editOld;
     $("edit-title").textContent = isSoa ? "Edit SOA record" : "Edit record";
     $("edit-name").value = displayName(r.name);
     $("edit-ttl").value = r.ttl;
@@ -890,6 +986,8 @@ $("edit-cancel").addEventListener("click", () => $("edit-dialog").close());
 $("edit-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const s = cur;
+  const old = editOld;
+  // For parsing only: after an await, s.store may be another store.
   const store = s.store;
   const status = $("edit-status");
   const btn = $("edit-save");
@@ -915,22 +1013,24 @@ $("edit-form").addEventListener("submit", async (e) => {
 
     if (type === TYPE_SOA) {
       status.textContent = "Sending update…";
-      const soa = await updateSoa(s, editRec, ttl, rdata);
+      const soa = await updateSoa(s, old, ttl, rdata);
       $("edit-dialog").close();
       if (!soa) {
         setStatus(s, "SOA record unchanged.");
         return;
       }
-      store.replace(editRec, "", TYPE_SOA, soa.ttl, soa.rdata);
-      store.serial = soaSerial(soa.rdata);
+      const live = s.store;
+      const i = live.findName("").find((i) => live.get(i).type === TYPE_SOA);
+      if (i === undefined) live.add("", TYPE_SOA, soa.ttl, soa.rdata);
+      else live.replace(i, "", TYPE_SOA, soa.ttl, soa.rdata);
+      live.serial = soaSerial(soa.rdata);
       rebuild(s);
-      setStatus(s, "Updated SOA record (serial " + store.serial + ").", "ok");
+      setStatus(s, "Updated SOA record (serial " + live.serial + ").", "ok");
       return;
     }
 
     const updates = [];
-    if (editRec !== null) {
-      const old = store.get(editRec);
+    if (old !== null) {
       updates.push({
         name: store.absolutize(old.name),
         type: old.type,
@@ -944,14 +1044,23 @@ $("edit-form").addEventListener("submit", async (e) => {
     status.textContent = "Sending update…";
     await performUpdate(s, updates);
 
-    if (editRec !== null) store.replace(editRec, nameRel, type, ttl, rdata);
-    else store.add(nameRel, type, ttl, rdata);
+    // Apply the same change to the current store, by contents: a refresh
+    // may have moved the old record or dropped it, and the new one may
+    // already be present.
+    const live = s.store;
+    if (old !== null) {
+      const i = live.indexOf(old.name, old.type, old.rdata);
+      if (i >= 0) live.remove(i);
+    }
+    const j = live.indexOf(nameRel, type, rdata);
+    if (j >= 0) live.replace(j, nameRel, type, ttl, rdata);
+    else live.add(nameRel, type, ttl, rdata);
 
     $("edit-dialog").close();
     rebuild(s);
     setStatus(
       s,
-      (editRec !== null ? "Updated " : "Added ") +
+      (old !== null ? "Updated " : "Added ") +
         displayName(nameRel) +
         " " +
         typeToName(type) +
@@ -967,8 +1076,9 @@ $("edit-form").addEventListener("submit", async (e) => {
 
 const SOA_ATTEMPTS = 5;
 
-// Change the SOA record `rec` of session `s` to `ttl` and `rdata`, whose
-// serial must be left as is: the serial is incremented here, since servers
+// Change the SOA record `old` ({ ttl, rdata } as the user saw it) of
+// session `s` to `ttl` and `rdata`, whose serial must be left as is: the
+// serial is incremented here, since servers
 // silently ignore SOA updates that do not increase it. A concurrent update
 // may have increased the serial meanwhile, which would also make this
 // update be ignored silently. Hence the update carries the SOA it is based
@@ -977,8 +1087,7 @@ const SOA_ATTEMPTS = 5;
 // changes are merged onto it and the update is retried.
 //
 // Returns the new { ttl, rdata }, or null if nothing was changed.
-async function updateSoa(s, rec, ttl, rdata) {
-  const old = s.store.get(rec);
+async function updateSoa(s, old, ttl, rdata) {
   const base = soaFields(old.rdata);
   const edited = soaFields(rdata);
   if (edited.serial !== base.serial) {
@@ -1024,7 +1133,7 @@ async function updateSoa(s, rec, ttl, rdata) {
 
 async function deleteRecord(rec) {
   const s = cur;
-  const r = s.store.get(rec);
+  const r = s.store.get(rec); // rec is stale after an await, r is not
   const what = displayName(r.name) + " " + typeToName(r.type);
   if (
     !confirm("Delete " + what + " record?\n\n" + rdataToText(r.type, r.rdata))
@@ -1042,7 +1151,10 @@ async function deleteRecord(rec) {
       },
     ];
     await performUpdate(s, updates);
-    s.store.remove(rec);
+    // A refresh during the update may have moved the record, or replaced
+    // s.store; find it again by its contents.
+    const i = s.store.indexOf(r.name, r.type, r.rdata);
+    if (i >= 0) s.store.remove(i);
     rebuild(s);
     setStatus(s, "Deleted " + what + " record.", "ok");
   } catch (err) {

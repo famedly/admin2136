@@ -34,6 +34,10 @@ separate key for updates of that zone can be entered. Likewise, if the server
 refuses the transfer of a member zone opened from a catalog with the catalog's
 key, another key for that zone can be entered.
 
+Zones are loaded with AXFR. Refreshing a zone requests only the changes since
+the last transfer with IXFR (RFC 1995). If the server cannot provide them with
+IXFR, it sends the full zone (AXFR) instead.
+
 ## Run
 
 The site is fully static and can be served by any web server. A Docker image

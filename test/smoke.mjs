@@ -30,6 +30,10 @@ import {
   IGNORED_RRTYPES,
   DnsError,
   isRejection,
+  ixfr,
+  axfr,
+  serialGt,
+  buildIxfrQuery,
 } from "../js/dnsops.js";
 import { ZoneStore } from "../js/zonestore.js";
 import {
@@ -830,6 +834,19 @@ check(
 
   const st = mkCatalog();
   eq("findName", st.findName("VERSION"), [2]);
+  {
+    const t = mkCatalog();
+    const v2 = parseTxt('"2"');
+    eq("indexOf", t.indexOf("VERSION", TYPE_TXT, v2), 2);
+    eq(
+      "indexOf other rdata",
+      t.indexOf("version", TYPE_TXT, parseTxt('"3"')),
+      -1,
+    );
+    eq("indexOf other type", t.indexOf("version", TYPE_SOA, v2), -1);
+    t.remove(0);
+    eq("indexOf after shift", t.indexOf("version", TYPE_TXT, v2), 1);
+  }
   const cat = parseCatalog(st);
   check("catalog detected", cat !== null);
   eq("catalog version", cat.version, "2");
@@ -887,6 +904,286 @@ check(
       ["group.b1.zones.catalog.invalid.", "TXT", CLASS_NONE],
     ],
   );
+}
+
+// --- IXFR (RFC 1995) ---
+{
+  const Z = "example.com.";
+  const soaRdata = (serial) => {
+    const w = new Writer();
+    w.name("ns1.example.com.").name("host.example.com.");
+    w.u32(serial).u32(3600).u32(600).u32(86400).u32(300);
+    return w.done();
+  };
+  const SOA = (serial) => ({
+    name: Z,
+    type: TYPE_SOA,
+    ttl: 300,
+    rdata: soaRdata(serial),
+  });
+  const A = (name, ip, ttl = 300) => ({
+    name: name + "." + Z,
+    type: TYPE_A,
+    ttl,
+    rdata: parseIpv4(ip),
+  });
+  const TXT = (name, text) => ({
+    name: name + "." + Z,
+    type: TYPE_TXT,
+    ttl: 300,
+    rdata: parseTxt(text),
+  });
+  const RRSIG = {
+    name: Z,
+    type: nameToType("RRSIG"),
+    ttl: 300,
+    rdata: Uint8Array.of(1, 2),
+  };
+
+  // A fake connection answering the query with the given messages, each a
+  // list of answer records.
+  const fakeConn = (messages, rcode = 0) => {
+    const conn = { sent: null, queue: [] };
+    conn.send = (msg) => {
+      conn.sent = msg;
+      for (const rrs of messages) {
+        const w = new Writer();
+        w.bytes(msg.subarray(0, 2))
+          .u16(0x8400 | rcode)
+          .u16(1)
+          .u16(rrs.length);
+        w.u16(0).u16(0);
+        w.name(Z).u16(251).u16(CLASS_IN);
+        for (const rr of rrs) {
+          w.name(rr.name).u16(rr.type).u16(CLASS_IN).u32(rr.ttl);
+          w.u16(rr.rdata.length).bytes(rr.rdata);
+        }
+        conn.queue.push(w.done());
+      }
+    };
+    conn.recv = async () => conn.queue.shift();
+    return conn;
+  };
+  const run = async (messages, clientSerial = 5) => {
+    const full = [];
+    const conn = fakeConn(messages);
+    const res = await ixfr(
+      conn,
+      Z,
+      null,
+      { ttl: 300, rdata: soaRdata(clientSerial) },
+      (rr) => full.push(rr),
+    );
+    return {
+      conn,
+      kind: res.kind,
+      serial: soaSerial(res.soa.rdata),
+      changes: res.changes.map(
+        (c) =>
+          c.op + " " + c.rr.name + " " + rdataToText(c.rr.type, c.rr.rdata),
+      ),
+      full: full.map((rr) => rr.name + " " + typeToName(rr.type)),
+    };
+  };
+
+  check("serialGt", serialGt(6, 5) && !serialGt(5, 5) && !serialGt(4, 5));
+  check("serialGt wraps", serialGt(1, 0xffffffff) && !serialGt(0xffffffff, 1));
+
+  const q = parseMessage(
+    buildIxfrQuery(3, Z, { ttl: 300, rdata: soaRdata(5) }),
+  );
+  eq("ixfr query type", q.questions[0].type, 251);
+  eq("ixfr query authority SOA", soaSerial(q.authority[0].rdata), 5);
+
+  let r = await run([[SOA(5)]]);
+  eq("ixfr up to date", [r.kind, r.serial], ["uptodate", 5]);
+  r = await run([[SOA(4)]]);
+  eq("ixfr older server", [r.kind, r.serial], ["uptodate", 4]);
+
+  // two difference sequences 5 -> 6 -> 7, split over messages
+  r = await run([
+    [SOA(7), SOA(5), A("x", "192.0.2.1"), SOA(6)],
+    [A("x", "192.0.2.2"), RRSIG, SOA(6), TXT("t", '"old"')],
+    [SOA(7), TXT("t", '"new"'), A("y", "192.0.2.3"), SOA(7)],
+  ]);
+  eq("ixfr incremental kind", [r.kind, r.serial], ["incremental", 7]);
+  eq("ixfr incremental changes", r.changes, [
+    "del x.example.com. 192.0.2.1",
+    "add x.example.com. 192.0.2.2",
+    'del t.example.com. "old"',
+    'add t.example.com. "new"',
+    "add y.example.com. 192.0.2.3",
+  ]);
+  eq("ixfr query sent", parseMessage(r.conn.sent).questions[0].type, 251);
+
+  // a difference sequence that only deletes
+  r = await run([[SOA(6), SOA(5), A("x", "192.0.2.1"), SOA(6), SOA(6)]]);
+  eq("ixfr deletion only", r.changes, ["del x.example.com. 192.0.2.1"]);
+
+  // full zone instead of differences
+  r = await run([
+    [SOA(7), A("x", "192.0.2.1")],
+    [TXT("t", '"x"'), SOA(7)],
+  ]);
+  eq("ixfr full kind", r.kind, "full");
+  eq("ixfr full records", r.full, [
+    "example.com. SOA",
+    "x.example.com. A",
+    "t.example.com. TXT",
+  ]);
+  r = await run([[SOA(7), SOA(7)]]);
+  eq(
+    "ixfr full SOA-only zone",
+    [r.kind, r.full],
+    ["full", ["example.com. SOA"]],
+  );
+
+  // errors
+  try {
+    await ixfr(
+      fakeConn([[]], 4),
+      Z,
+      null,
+      { ttl: 0, rdata: soaRdata(5) },
+      () => {},
+    );
+    check("ixfr NOTIMP throws", false);
+  } catch (e) {
+    check("ixfr NOTIMP is a DnsError", e instanceof DnsError && e.rcode === 4);
+  }
+
+  // AXFR on top of the shared stream code
+  const seen = [];
+  const n = await axfr(
+    fakeConn([[SOA(7), A("x", "192.0.2.1"), RRSIG], [SOA(7)]]),
+    Z,
+    null,
+    (rr) => seen.push(typeToName(rr.type)),
+  );
+  eq("axfr records", [n, seen], [2, ["SOA", "A"]]);
+
+  // applying the changes to a store: relative to the last transfer
+  const mkStore = () => {
+    const st = new ZoneStore("example.com");
+    st.add("", TYPE_SOA, 300, soaRdata(5));
+    st.add("www", TYPE_A, 300, parseIpv4("192.0.2.1"));
+    st.add("mail", TYPE_A, 300, parseIpv4("192.0.2.9"));
+    st.add("t", TYPE_TXT, 300, parseTxt('"keep"'));
+    st.add("t", TYPE_TXT, 300, parseTxt('"old"'));
+    st.serial = 5;
+    st.syncSoa = { ttl: 300, rdata: soaRdata(5) };
+    st.markSynced();
+    return st;
+  };
+  const dump = (st) => {
+    const out = [];
+    for (let i = 0; i < st.count; i++) {
+      const x = st.get(i);
+      out.push(
+        (x.name || "@") +
+          " " +
+          x.ttl +
+          " " +
+          typeToName(x.type) +
+          " " +
+          rdataToText(x.type, x.rdata),
+      );
+    }
+    return out.sort();
+  };
+  const ch = (op, rr) => ({ op, rr });
+  const base = dump(mkStore());
+
+  // Local edits acknowledged by the server: one it applied (mine), and
+  // ones it silently ignored (phantom add, phantom delete, duplicate add,
+  // phantom TTL change via replace, SOA edit).
+  const st = mkStore();
+  st.add("mine", TYPE_A, 300, parseIpv4("192.0.2.50"));
+  st.add("phantom", TYPE_A, 300, parseIpv4("192.0.2.66"));
+  st.remove(2); // mail
+  st.add("www", TYPE_A, 300, parseIpv4("192.0.2.1")); // duplicate
+  st.replace(3, "t", TYPE_TXT, 999, parseTxt('"keep"'));
+  st.replace(0, "", TYPE_SOA, 300, soaRdata(6));
+  st.serial = 6;
+
+  // revertToSynced() restores exactly the transferred contents
+  const reverted = mkStore();
+  reverted.add("x", TYPE_A, 1, parseIpv4("192.0.2.99"));
+  reverted.remove(1);
+  reverted.replace(0, "", TYPE_SOA, 300, soaRdata(9));
+  reverted.serial = 9;
+  eq("revert reports changes", reverted.revertToSynced(), true);
+  eq("revert restores contents", dump(reverted), base);
+  eq("revert restores serial", reverted.serial, 5);
+  eq("revert without changes", reverted.revertToSynced(), false);
+
+  const ok = st.applyChanges(
+    [
+      // 5 -> 6: www changes address, t "old" goes, mine was applied
+      ch("del", A("www", "192.0.2.1")),
+      ch("del", TXT("t", '"old"')),
+      ch("add", A("www", "192.0.2.2")),
+      ch("add", A("mine", "192.0.2.50")),
+      // 6 -> 7: TTL change of www, a record added and removed again
+      ch("del", A("www", "192.0.2.2")),
+      ch("add", A("new", "192.0.2.7")),
+      ch("add", A("WWW", "192.0.2.2", 600)),
+      ch("del", A("new", "192.0.2.7")),
+    ],
+    SOA(7),
+  );
+  eq("applyChanges succeeds", ok, true);
+  eq("applyChanges yields the server state", dump(st), [
+    "@ 300 SOA ns1.example.com. host.example.com. 7 3600 600 86400 300",
+    "WWW 600 A 192.0.2.2",
+    "mail 300 A 192.0.2.9",
+    "mine 300 A 192.0.2.50",
+    't 300 TXT "keep"',
+  ]);
+  eq("applyChanges serial", st.serial, 7);
+  eq("applyChanges sync SOA", soaSerial(st.syncSoa.rdata), 7);
+  eq("applyChanges new sync point", st.revertToSynced(), false);
+
+  // differences that do not fit the last transfer are rejected untouched
+  for (const [what, changes] of [
+    ["deletion of a missing record", [ch("del", A("gone", "192.0.2.5"))]],
+    ["addition of a present record", [ch("add", A("mail", "192.0.2.9"))]],
+    [
+      "double deletion",
+      [ch("del", A("mail", "192.0.2.9")), ch("del", A("mail", "192.0.2.9"))],
+    ],
+  ]) {
+    const bad = mkStore();
+    bad.add("local", TYPE_A, 300, parseIpv4("192.0.2.70"));
+    eq(
+      "applyChanges rejects " + what,
+      bad.applyChanges(changes, SOA(7)),
+      false,
+    );
+    eq("rejected " + what + " leaves the last transfer", dump(bad), base);
+    eq(
+      "rejected " + what + " keeps the sync SOA",
+      soaSerial(bad.syncSoa.rdata),
+      5,
+    );
+  }
+
+  // compaction keeps all records and drops the garbage
+  const before = dump(st);
+  for (let i = 0; i < 5000; i++)
+    st.replace(
+      1,
+      st.get(1).name,
+      st.get(1).type,
+      st.get(1).ttl,
+      st.get(1).rdata.slice(),
+    );
+  const bloated = st.arenaLen;
+  st.compact();
+  eq("compact keeps records", dump(st), before);
+  check("compact shrinks arena", st.arenaLen < bloated / 10);
+  st.add("after", TYPE_A, 1, parseIpv4("192.0.2.8"));
+  eq("store usable after compact", st.get(st.count - 1).name, "after");
 }
 
 if (failures) {

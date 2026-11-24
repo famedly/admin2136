@@ -18,7 +18,11 @@
 //
 // The class is not stored: zones transferred via AXFR are single-class (IN).
 // Replacing or removing records leaves garbage in the arena; it is reclaimed
-// on the next zone reload, which is fine for an editing session.
+// on the next full zone reload, or by compaction when applying incremental
+// changes leaves more garbage than live data.
+
+import { TYPE_SOA } from "./dnswire.js";
+import { soaSerial } from "./rdata.js";
 
 const te = new TextEncoder();
 const td = new TextDecoder();
@@ -79,12 +83,19 @@ export class ZoneStore {
     this.offsets = new Uint32Array(1024);
     this.count = 0;
     this.serial = null; // SOA serial, tracked by the app
+    // The SOA { ttl, rdata } of the last zone transfer, which an IXFR
+    // starts from, and the record offsets of the zone contents sent with
+    // it, see markSynced(). Local edits change neither.
+    this.syncSoa = null;
+    this.syncOffsets = null;
   }
 
   clear() {
     this.arenaLen = 0;
     this.count = 0;
     this.serial = null;
+    this.syncSoa = null;
+    this.syncOffsets = null;
   }
 
   // 'www.example.com.' -> 'www'; apex -> ''; out-of-zone names are kept
@@ -159,6 +170,128 @@ export class ZoneStore {
     this.count--;
   }
 
+  // Remove all records whose indices are in the Set `drop`, in one pass.
+  // Like remove(), this shifts the indices of the remaining records.
+  removeMany(drop) {
+    let j = 0;
+    for (let i = 0; i < this.count; i++) {
+      if (!drop.has(i)) this.offsets[j++] = this.offsets[i];
+    }
+    this.count = j;
+  }
+
+  // Size in bytes of record i in the arena.
+  _size(i) {
+    const a = this.arena;
+    const o = this.offsets[i];
+    const p = o + 1 + a[o]; // type, ttl, rdata length
+    return p + 8 + ((a[p + 6] << 8) | a[p + 7]) - o;
+  }
+
+  // Copy all records into a fresh arena, dropping the garbage left by
+  // replace() and remove(). Record indices stay the same.
+  compact() {
+    let live = 0;
+    for (let i = 0; i < this.count; i++) live += this._size(i);
+    const fresh = new Uint8Array(Math.max(1 << 16, live * 2));
+    let o = 0;
+    for (let i = 0; i < this.count; i++) {
+      const n = this._size(i);
+      const start = this.offsets[i];
+      fresh.set(this.arena.subarray(start, start + n), o);
+      this.offsets[i] = o;
+      o += n;
+    }
+    this.arena = fresh;
+    this.arenaLen = o;
+  }
+
+  // Remember the current contents as the server's version of the zone,
+  // as of the SOA `syncSoa`; called after every transfer. Local edits
+  // made afterwards can be discarded with revertToSynced().
+  //
+  // Records are never overwritten in the arena (replace() and remove()
+  // only redirect or drop offsets), so the offsets are a complete snapshot.
+  // Hence compact() must only run while no local edits are pending.
+  markSynced() {
+    this.syncOffsets = this.offsets.slice(0, this.count);
+  }
+
+  // Return to the contents last passed to markSynced(), dropping all local
+  // edits since. Returns whether that changed anything.
+  revertToSynced() {
+    const snap = this.syncOffsets;
+    if (!snap) return false;
+    let changed = this.count !== snap.length;
+    for (let i = 0; !changed && i < snap.length; i++) {
+      changed = this.offsets[i] !== snap[i];
+    }
+    this.offsets.set(snap); // the offsets array never shrinks
+    this.count = snap.length;
+    this.serial = soaSerial(this.syncSoa.rdata);
+    return changed;
+  }
+
+  // Apply the differences of an IXFR: a list of { op: "del" | "add", rr } in
+  // order, with absolute owner names, plus the server's new SOA record
+  // `soa`. They describe the changes relative to the zone contents the
+  // server sent last, so local edits made since are discarded first: the
+  // server reports their effect in the differences if (and only if) it
+  // actually applied them.
+  //
+  // A record is identified by its owner name (case-insensitively), type
+  // and rdata. Every deletion must remove a present record and every
+  // addition must add a missing one; otherwise the differences do not fit
+  // the last transfer and false is returned with nothing applied (beyond
+  // discarding local edits), so the caller can fall back to a full
+  // transfer. Returns true on success.
+  applyChanges(changes, soa) {
+    this.revertToSynced();
+    const key = (name, type, rdata) => {
+      let k = name.toLowerCase() + "\0" + type + "\0";
+      for (const b of rdata) k += String.fromCharCode(b);
+      return k;
+    };
+    const names = new Set();
+    for (const { rr } of changes) {
+      names.add(this.relativize(rr.name).toLowerCase());
+    }
+
+    // Locate the records the changes refer to, and the SOA.
+    const found = new Map(); // key -> index
+    const drop = new Set();
+    let live = 0;
+    for (let i = 0; i < this.count; i++) {
+      live += this._size(i);
+      const r = this.get(i);
+      const name = r.name.toLowerCase();
+      if (name === "" && r.type === TYPE_SOA) drop.add(i);
+      else if (names.has(name)) found.set(key(name, r.type, r.rdata), i);
+    }
+
+    // Replay the changes on the presence of each record, validating them.
+    const state = new Map(); // key -> { present, rel, rr }
+    for (const { op, rr } of changes) {
+      const rel = this.relativize(rr.name);
+      const k = key(rel, rr.type, rr.rdata);
+      const present = state.has(k) ? state.get(k).present : found.has(k);
+      if (present !== (op === "del")) return false;
+      state.set(k, { present: op === "add", rel, rr });
+    }
+
+    for (const k of state.keys()) if (found.has(k)) drop.add(found.get(k));
+    this.removeMany(drop);
+    for (const { present, rel, rr } of state.values()) {
+      if (present) this.add(rel, rr.type, rr.ttl, rr.rdata);
+    }
+    this.add("", TYPE_SOA, soa.ttl, soa.rdata);
+    this.serial = soaSerial(soa.rdata);
+    this.syncSoa = { ttl: soa.ttl, rdata: soa.rdata };
+    if (this.arenaLen > 2 * live + (1 << 16)) this.compact();
+    this.markSynced();
+    return true;
+  }
+
   // Display-order comparator for two record indices, reading straight from
   // the arena: sorts by (revname, type, ttl). revname is the DNS name
   // compared alphabetically with its labels reversed, so names group by
@@ -204,6 +337,25 @@ export class ZoneStore {
       if (j === want.length) out.push(i);
     }
     return out;
+  }
+
+  // Index of the record with relative owner name `rel` (compared
+  // case-insensitively), `type` and `rdata`, or -1. Record indices shift
+  // whenever records are removed, so code that awaits anything (or keeps
+  // a dialog open) remembers a record by its contents and looks it up here
+  // afterwards.
+  indexOf(rel, type, rdata) {
+    for (const i of this.findName(rel)) {
+      const r = this.get(i);
+      if (
+        r.type === type &&
+        r.rdata.length === rdata.length &&
+        r.rdata.every((b, j) => b === rdata[j])
+      ) {
+        return i;
+      }
+    }
+    return -1;
   }
 
   // Decode record i. `rdata` is a view into the arena: valid until the store
