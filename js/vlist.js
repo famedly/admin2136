@@ -29,10 +29,6 @@ export class VirtualList {
     this._update(true);
   }
 
-  refresh() {
-    this._update(true);
-  }
-
   _ensurePool(n) {
     while (this.pool.length < n) {
       const el = document.createElement("div");

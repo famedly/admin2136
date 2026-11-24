@@ -823,7 +823,6 @@ export function parseTxt(text) {
     let i = 0;
     while (i < t.length) {
       while (i < t.length && (t[i] === " " || t[i] === "\t")) i++;
-      if (i >= t.length) break;
       if (t[i] !== '"') throw new Error("expected opening quote in TXT data");
       i++;
       const bytes = [];

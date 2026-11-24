@@ -140,10 +140,9 @@ async function streamTransfer(conn, msg, tsigKey, what, onRecord) {
         console.log(tag + " reply #" + frameNo + " carries no TSIG (deferred)");
       }
     }
-    let progressed = false;
+    // (A TSIG RR is always in the additional section.)
+    const progressed = resp.answers.length > 0;
     for (const rr of resp.answers) {
-      if (rr.type === TYPE_TSIG) continue;
-      progressed = true;
       if (IGNORED_RRTYPES.has(rr.type)) continue; // consumed, not reported
       if (onRecord(rr)) {
         done = true;
@@ -306,6 +305,6 @@ export async function query(conn, qname, qtype, tsigKey) {
     if (resp.id !== id) continue;
     if (resp.rcode !== 0) throw new DnsError("query failed", resp);
     if (tsig) await tsig.verify(raw);
-    return resp.answers.filter((rr) => rr.type !== TYPE_TSIG);
+    return resp.answers;
   }
 }

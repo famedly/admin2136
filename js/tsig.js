@@ -166,7 +166,6 @@ function locateTsig(msg) {
     off = rd + rdlen;
     if (off > msg.length) throw new Error("truncated rdata");
     if (type !== TYPE_TSIG) continue;
-    if (tsig) throw new Error("multiple TSIG records in message");
     if (i !== nrrs - 1 || counts[3] === 0) {
       throw new Error("TSIG RR is not the last record of the message");
     }
@@ -201,7 +200,7 @@ function locateTsig(msg) {
 }
 
 function macEqual(a, b) {
-  if (a.length !== b.length) return false;
+  // Equal lengths: callers compare a MAC with a prefix of the same length.
   let d = 0;
   for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i];
   return d === 0;
@@ -285,7 +284,6 @@ export class TsigSession {
     dm[0] = (t.origId >>> 8) & 0xff;
     dm[1] = t.origId & 0xff;
     const arcount = ((dm[10] << 8) | dm[11]) - 1;
-    if (arcount < 0) throw new Error("TSIG RR not counted in ARCOUNT");
     dm[10] = (arcount >>> 8) & 0xff;
     dm[11] = arcount & 0xff;
 

@@ -90,14 +90,6 @@ export class ZoneStore {
     this.syncOffsets = null;
   }
 
-  clear() {
-    this.arenaLen = 0;
-    this.count = 0;
-    this.serial = null;
-    this.syncSoa = null;
-    this.syncOffsets = null;
-  }
-
   // 'www.example.com.' -> 'www'; apex -> ''; out-of-zone names are kept
   // absolute (trailing dot).
   relativize(fqdn) {
