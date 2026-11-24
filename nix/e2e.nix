@@ -35,6 +35,39 @@
         '';
       };
 
+      # The test setup (site, dows, Knot with the catalog and its zones)
+      # for manual use, until Ctrl-C: `nix run .#test-env`
+      apps.test-env = {
+        type = "app";
+        program = lib.getExe (
+          pkgs.writeShellApplication {
+            name = "admin2136-test-env";
+            runtimeInputs = [
+              pkgs.nodejs
+              pkgs.knot-dns
+              inputs.dows.packages.${system}.dows
+            ];
+            text =
+              let
+                src = lib.fileset.toSource {
+                  root = ../.;
+                  fileset = lib.fileset.unions [
+                    ../index.html
+                    ../style.css
+                    ../js
+                    ../test/e2e
+                  ];
+                };
+              in
+              ''
+                export ADMIN2136_KNOT_MODULE=${config.packages.knot-mod-ignoreme}/lib/knot/ignoreme.so
+                exec node ${src}/test/e2e/serve.mjs "$@"
+              '';
+          }
+        );
+        meta.description = "admin2136 test setup: site, dows and Knot DNS";
+      };
+
       devshells.e2e = {
         devshell.packages = [
           pkgs.nodejs

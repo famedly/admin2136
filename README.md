@@ -73,6 +73,20 @@ contents even then. The nix devshell `e2e` provides all of it:
 $ nix develop .#e2e --command node test/e2e/run.mjs
 ```
 
+The same setup (site, dows and Knot with the catalog zone, its groups and the
+initial zones) can be started for manual use. It prints the ports and the
+randomly generated TSIG keys, and runs until Ctrl-C:
+
+```console
+$ nix run .#test-env
+```
+
+The services listen on the loopback interface only and are shown as `localhost`.
+Inside a Docker container (or with `ADMIN2136_DOCKER=1`), they listen on all
+interfaces and are shown with the container's IP address instead. Browsers only
+provide Web Crypto, which TSIG needs, on `localhost` and HTTPS, so use port
+forwarding to log in with a key from the host.
+
 The coverage of both test suites together, with `--details` listing uncovered
 branches:
 

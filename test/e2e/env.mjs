@@ -86,15 +86,18 @@ function zoneFiles() {
   };
 }
 
-function knotConf(dir, port, keys, module) {
+function knotConf(dir, port, keys, module, net) {
   const key = (id) =>
     `  - id: ${id}\n    algorithm: hmac-sha256\n    secret: ${keys[id]}\n`;
   const tpl = (id, acl) =>
     `  - id: ${id}\n    storage: ${dir}/zones\n    zonefile-sync: -1\n` +
     `    journal-content: changes\n    module: mod-ignoreme\n` +
     (acl ? `    acl: [${acl}]\n` : "");
+  // Knot binds IPv6 sockets IPv6-only, so "::" needs IPv4 explicitly.
+  const listen =
+    net.bind === "::" ? `0.0.0.0@${port}, ::@${port}` : `${net.bind}@${port}`;
   return (
-    `server:\n    listen: 127.0.0.1@${port}\n    rundir: ${dir}/run\n` +
+    `server:\n    listen: [${listen}]\n    rundir: ${dir}/run\n` +
     `log:\n  - target: ${dir}/knot.log\n    any: info\n` +
     `database:\n    storage: ${dir}/db\n` +
     `key:\n${key("kc")}${key("kz")}${key("ku")}` +
@@ -105,7 +108,7 @@ function knotConf(dir, port, keys, module) {
     "  - id: kz-all\n    key: kz\n    action: [transfer, update]\n" +
     "  - id: ku-update\n    key: ku\n    action: update\n" +
     "  - id: ku-transfer\n    key: ku\n    action: transfer\n" +
-    "  - id: local\n    address: 127.0.0.1\n    action: [transfer, update]\n" +
+    `  - id: local\n    address: [${net.local.join(", ")}]\n    action: [transfer, update]\n` +
     `module:\n  - id: mod-ignoreme\n    file: ${module}\n` +
     "template:\n" +
     tpl("default") +
@@ -121,7 +124,7 @@ function knotConf(dir, port, keys, module) {
 }
 
 // Static file server for the site (repository root).
-function webServer(root, port) {
+function webServer(root, port, bind) {
   const types = {
     ".html": "text/html",
     ".js": "text/javascript",
@@ -146,16 +149,14 @@ function webServer(root, port) {
       res.end(data);
     });
   });
-  return new Promise((resolve) =>
-    srv.listen(port, "127.0.0.1", () => resolve(srv)),
-  );
+  return new Promise((resolve) => srv.listen(port, bind, () => resolve(srv)));
 }
 
 // TCP relay in front of Knot that passes the server's replies on slowly
 // (32 KiB per 50 ms) and can cut all its connections, to interrupt
 // transfers. It reads from Knot at full speed (Knot drops clients that do
 // not read), so it buffers.
-function slowRelay(port, upstreamPort) {
+function slowRelay(port, upstreamPort, bind) {
   const conns = new Set();
   const srv = createNetServer((client) => {
     const up = connect(upstreamPort, "127.0.0.1");
@@ -186,9 +187,7 @@ function slowRelay(port, upstreamPort) {
   srv.cut = () => {
     for (const c of [...conns]) c.close();
   };
-  return new Promise((resolve) =>
-    srv.listen(port, "127.0.0.1", () => resolve(srv)),
-  );
+  return new Promise((resolve) => srv.listen(port, bind, () => resolve(srv)));
 }
 function startProcess(cmd, args, opts, logFile) {
   const log = fs.openSync(logFile, "a");
@@ -197,7 +196,24 @@ function startProcess(cmd, args, opts, logFile) {
   return child;
 }
 
-export async function startEnv(root, dir) {
+// Network options of startEnv(); the defaults keep everything on 127.0.0.1.
+//   bind     address the services listen on ("::" for all interfaces)
+//   host     address (or name) the URLs and the nameserver use
+//   aliases  other addresses (or names) of the host to accept for the
+//            nameserver (dows checks upstreams literally) and the origin
+//   local    addresses allowed to use the unsigned zone open.example
+//   anyOrigin  allow WebSocket connections from any origin (when the
+//            site's external address is not known, e.g. port forwarding)
+const NET = {
+  bind: "127.0.0.1",
+  host: "127.0.0.1",
+  aliases: [],
+  local: ["127.0.0.1"],
+  anyOrigin: false,
+};
+
+export async function startEnv(root, dir, netOpts = {}) {
+  const net = { ...NET, ...netOpts };
   const module = process.env.ADMIN2136_KNOT_MODULE;
   if (!module) {
     throw new Error(
@@ -223,19 +239,21 @@ export async function startEnv(root, dir) {
     fs.writeFileSync(path.join(dir, "zones", zone + ".zone"), text);
   }
   const confFile = path.join(dir, "knot.conf");
-  fs.writeFileSync(confFile, knotConf(dir, ports.knot, keys, module));
+  fs.writeFileSync(confFile, knotConf(dir, ports.knot, keys, module, net));
 
   const procs = [];
+  const url = (h) => (h.includes(":") ? `[${h}]` : h); // IPv6 in brackets
+  const hosts = [net.host, ...net.aliases];
   const env = {
     dir,
     ports,
     keys,
     spec,
-    origin: `http://127.0.0.1:${ports.web}`,
-    proxyUrl: `ws://127.0.0.1:${ports.dows}`,
-    nameserver: `127.0.0.1:${ports.knot}`,
+    origin: `http://${url(net.host)}:${ports.web}`,
+    proxyUrl: `ws://${url(net.host)}:${ports.dows}`,
+    nameserver: `${url(net.host)}:${ports.knot}`,
     // the same nameserver through slowRelay()
-    slowNameserver: `127.0.0.1:${ports.relay}`,
+    slowNameserver: `${url(net.host)}:${ports.relay}`,
   };
 
   // Plain knsupdate / kdig / knotc wrappers.
@@ -295,14 +313,30 @@ export async function startEnv(root, dir) {
     return Number(out.trim().split(/\s+/)[2]);
   };
 
+  // Stop all services and wait until the processes are gone (killed if
+  // they do not exit within 5 seconds).
   env.stop = async () => {
-    for (const p of procs) p.kill("SIGTERM");
+    const exited = procs.map((p) =>
+      p.exitCode !== null || p.signalCode !== null
+        ? null
+        : new Promise((resolve) => {
+            const timer = setTimeout(() => p.kill("SIGKILL"), 5000);
+            p.on("exit", () => {
+              clearTimeout(timer);
+              resolve();
+            });
+            p.kill("SIGTERM");
+          }),
+    );
     if (env.relay) {
       env.relay.cut();
       env.relay.close();
     }
-    if (env.web) await new Promise((r) => env.web.close(r));
-    await sleep(200);
+    if (env.web) {
+      env.web.closeAllConnections();
+      await new Promise((r) => env.web.close(r));
+    }
+    await Promise.all(exited);
   };
 
   try {
@@ -346,15 +380,20 @@ export async function startEnv(root, dir) {
     );
 
     // dows; restartDows() drops all WebSocket connections.
+    const upstreams = hosts.flatMap((h) => [
+      `${url(h)}:${ports.knot}`,
+      `${url(h)}:${ports.relay}`,
+    ]);
+    const origins = hosts.map((h) => `http://${url(h)}:${ports.web}`);
     const startDows = async () => {
       env.dows = startProcess(
         "dows",
-        [`127.0.0.1:${ports.dows}`],
+        [`${url(net.bind)}:${ports.dows}`],
         {
           env: {
             ...process.env,
-            DOWS_ALLOWED_UPSTREAMS: env.nameserver + "," + env.slowNameserver,
-            DOWS_ALLOWED_ORIGINS: env.origin,
+            DOWS_ALLOWED_UPSTREAMS: upstreams.join(","),
+            DOWS_ALLOWED_ORIGINS: net.anyOrigin ? "*" : origins.join(","),
           },
         },
         path.join(dir, "dows.out"),
@@ -381,8 +420,8 @@ export async function startEnv(root, dir) {
       await startDows();
     };
     await startDows();
-    env.relay = await slowRelay(ports.relay, ports.knot);
-    env.web = await webServer(root, ports.web);
+    env.relay = await slowRelay(ports.relay, ports.knot, net.bind);
+    env.web = await webServer(root, ports.web, net.bind);
   } catch (err) {
     await env.stop();
     throw new Error(
