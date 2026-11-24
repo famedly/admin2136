@@ -39,9 +39,14 @@ const RCODES = {
 export const RCODE_FORMERR = 1;
 export const RCODE_SERVFAIL = 2;
 export const RCODE_NOTIMP = 4;
-const RCODE_REFUSED = 5;
+export const RCODE_REFUSED = 5;
+export const RCODE_YXRRSET = 7;
 export const RCODE_NXRRSET = 8;
 const RCODE_NOTAUTH = 9;
+
+const TYPE_OPT = 41;
+const EDNS_EDE = 15; // Extended DNS Error option (RFC 8914)
+const EDE_INVALID_DATA = 24;
 
 export function rcodeName(rc) {
   return RCODES[rc] || "RCODE" + rc;
@@ -56,7 +61,7 @@ function randId() {
 }
 
 // A DNS error response. `rcode` is the response code, `tsigError` the
-// TSIG error name (e.g. "BADKEY") or null.
+// TSIG error name (e.g. "BADKEY") or null, `response` the parsed message.
 export class DnsError extends Error {
   constructor(what, resp) {
     const tsig = resp.additional.find((rr) => rr.type === TYPE_TSIG);
@@ -69,6 +74,7 @@ export class DnsError extends Error {
     );
     this.rcode = resp.rcode;
     this.tsigError = tsigError;
+    this.response = resp;
   }
 }
 
@@ -293,10 +299,19 @@ export async function sendUpdate(conn, zone, tsigKey, updates, prereqs = []) {
 }
 
 // Query `qname`/`qtype` and return the answer records of the response.
-export async function query(conn, qname, qtype, tsigKey) {
+// With `edns`, the query carries an OPT record (RFC 6891), so that the
+// server can add Extended DNS Errors to its response.
+export async function query(
+  conn,
+  qname,
+  qtype,
+  tsigKey,
+  { edns = false } = {},
+) {
   const id = randId();
   const tsig = tsigKey ? new TsigSession(tsigKey) : null;
   let msg = buildQuery(id, qname, qtype);
+  if (edns) msg = withOpt(msg);
   if (tsig) msg = await tsig.sign(msg);
   conn.send(msg);
   for (;;) {
@@ -307,4 +322,74 @@ export async function query(conn, qname, qtype, tsigKey) {
     if (tsig) await tsig.verify(raw);
     return resp.answers;
   }
+}
+
+// Append an empty OPT record (UDP payload size 1232) to message `msg`.
+function withOpt(msg) {
+  const w = new Writer(msg.length + 11);
+  w.bytes(msg).u8(0).u16(TYPE_OPT).u16(1232).u32(0).u16(0);
+  const out = w.done();
+  out[11] += 1; // ARCOUNT (queries have no other additional records)
+  return out;
+}
+
+// The Extended DNS Error codes (RFC 8914) of a parsed response.
+export function ednsErrors(resp) {
+  const codes = [];
+  for (const rr of resp.additional) {
+    if (rr.type !== TYPE_OPT) continue;
+    const d = rr.rdata;
+    for (let o = 0; o + 4 <= d.length; ) {
+      const code = (d[o] << 8) | d[o + 1];
+      const len = (d[o + 2] << 8) | d[o + 3];
+      if (code === EDNS_EDE && len >= 2) codes.push((d[o + 4] << 8) | d[o + 5]);
+      o += 4 + len;
+    }
+  }
+  return codes;
+}
+
+// Whether the response to a SOA query (with EDNS) says that the zone is
+// configured on the server but has no contents yet: Knot DNS answers
+// SERVFAIL without any records, with the Extended DNS Error "Invalid
+// Data" (an unknown zone gets REFUSED instead).
+export function isUnsetZoneResponse(resp) {
+  const ede = ednsErrors(resp);
+  return (
+    resp.rcode === RCODE_SERVFAIL &&
+    resp.answers.length === 0 &&
+    resp.authority.length === 0 &&
+    ede.every((code) => code === EDE_INVALID_DATA)
+  );
+}
+
+// Send many (unsigned) queries at once, at most `window` of them in flight,
+// and match the responses by ID. `questions` are { name, type }; resolves
+// to one result per question: the parsed response (any rcode).
+export async function queryAll(conn, questions, window = 32) {
+  const results = new Array(questions.length);
+  const inFlight = new Map(); // id -> question index
+  let next = 0;
+  let done = 0;
+  const fill = () => {
+    while (inFlight.size < window && next < questions.length) {
+      let id;
+      do id = randId();
+      while (inFlight.has(id));
+      inFlight.set(id, next);
+      const q = questions[next++];
+      conn.send(buildQuery(id, q.name, q.type));
+    }
+  };
+  fill();
+  while (done < questions.length) {
+    const resp = parseMessage(await conn.recv());
+    const i = inFlight.get(resp.id);
+    if (i === undefined) continue; // stray message
+    inFlight.delete(resp.id);
+    results[i] = resp;
+    done++;
+    fill();
+  }
+  return results;
 }

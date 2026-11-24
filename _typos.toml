@@ -4,3 +4,4 @@
 
 [default.extend-words]
 dows = "dows" # DNS over WebSocket
+ede = "ede" # Extended DNS Error (RFC 8914)

@@ -13,7 +13,9 @@
 //   axfr-only  transfers; updates need the key ku
 //   full       transfers and updates (the default template)
 //
-// The key ku may also transfer (but not update) the catalog zone itself.
+// A fourth group, signed, is like full with automatic DNSSEC signing; no
+// zone is in it initially. The key ku may also transfer (but not update)
+// the catalog zone itself.
 // open.example. is a standalone zone without TSIG (address-based ACL).
 //
 // All zones load the test module mod-ignoreme (see knot/ignoreme.c),
@@ -89,10 +91,11 @@ function zoneFiles() {
 function knotConf(dir, port, keys, module, net) {
   const key = (id) =>
     `  - id: ${id}\n    algorithm: hmac-sha256\n    secret: ${keys[id]}\n`;
-  const tpl = (id, acl) =>
+  const tpl = (id, acl, extra = "") =>
     `  - id: ${id}\n    storage: ${dir}/zones\n    zonefile-sync: -1\n` +
     `    journal-content: changes\n    module: mod-ignoreme\n` +
-    (acl ? `    acl: [${acl}]\n` : "");
+    (acl ? `    acl: [${acl}]\n` : "") +
+    extra;
   // Knot binds IPv6 sockets IPv6-only, so "::" needs IPv4 explicitly.
   const listen =
     net.bind === "::" ? `0.0.0.0@${port}, ::@${port}` : `${net.bind}@${port}`;
@@ -115,10 +118,11 @@ function knotConf(dir, port, keys, module, net) {
     tpl("full", "kc-transfer, kc-update") +
     tpl("own-key", "kz-all") +
     tpl("axfr-only", "kc-transfer, ku-update") +
+    tpl("signed", "kc-transfer, kc-update", "    dnssec-signing: on\n") +
     "zone:\n" +
     "  - domain: catalog.test\n    acl: [catalog, ku-transfer]\n" +
     "    catalog-role: interpret\n" +
-    "    catalog-template: [full, own-key, axfr-only]\n" +
+    "    catalog-template: [full, own-key, axfr-only, signed]\n" +
     "  - domain: open.example\n    acl: local\n"
   );
 }
@@ -284,6 +288,7 @@ export async function startEnv(root, dir, netOpts = {}) {
     return stdout;
   };
   env.knotc = (...args) => run("knotc", ["-c", confFile, ...args]);
+  env.keymgr = (...args) => run("keymgr", ["-c", confFile, ...args]);
 
   // The zone as the server has it: [name, ttl, type, data] records
   // (relative names, "@" for the apex), the SOA once. `generic` gives the

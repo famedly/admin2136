@@ -10,13 +10,20 @@ import {
   axfr,
   ixfr,
   query,
+  queryAll,
   sendUpdate,
   isRejection,
+  isUnsetZoneResponse,
+  rcodeName,
   DnsError,
   RCODE_FORMERR,
+  RCODE_SERVFAIL,
   RCODE_NOTIMP,
+  RCODE_REFUSED,
+  RCODE_YXRRSET,
   RCODE_NXRRSET,
 } from "./dnsops.js";
+import { dsRdata, dsKeys } from "./dnssec.js";
 import { parseTsigSpec } from "./tsig.js";
 import { ZoneStore } from "./zonestore.js";
 import { VirtualList } from "./vlist.js";
@@ -40,9 +47,13 @@ import {
 } from "./catalog.js";
 import {
   nameToWire,
+  readName,
   typeToName,
   nameToType,
+  TYPE_NS,
   TYPE_SOA,
+  TYPE_DS,
+  TYPE_DNSKEY,
   CLASS_IN,
   CLASS_NONE,
 } from "./dnswire.js";
@@ -82,6 +93,17 @@ function newSession(zone, tsigKey, depth) {
     filter: "",
     loadingSerial: null, // serial shown while the initial load runs
     opening: false, // a member zone is being opened from this catalog
+    // the zone's own row (like a catalog member's) if it has no records
+    // yet and was logged in to directly, see enterSetup()
+    setup: null,
+    // catalog view: SOA and NS records of member zones by lowercase name
+    // ({ state: "loading" | "ok" | "unset" | "error", ... }), see
+    // fetchZoneInfo(); zones to be added; input kept across refreshes
+    zoneInfo: new Map(),
+    drafts: [],
+    keptEdits: new Map(),
+    infoQueue: new Set(), // zones on screen to query, see queueZoneInfo()
+    infoTimer: null,
     status: { text: "", cls: "" },
     scroll: { records: 0, zones: 0 },
   };
@@ -104,7 +126,7 @@ function displayName(rel) {
 }
 
 function showsZones(s) {
-  return s.catalog !== null && !s.showRaw;
+  return s.setup !== null || (s.catalog !== null && !s.showRaw);
 }
 
 // Map a DoWS proxy WebSocket URL to the corresponding HTTP(S) URL where the
@@ -372,15 +394,24 @@ function rebuild(s) {
 // Apply the session's filter to the list it currently shows.
 function applyFilter(s) {
   const q = s.filter.trim().toLowerCase();
-  if (showsZones(s)) {
+  if (s.setup) {
+    s.zoneView = [s.setup];
+  } else if (showsZones(s)) {
     s.zoneView = !q
       ? s.catalog.members
-      : s.catalog.members.filter(
-          (m) =>
-            m.zone.toLowerCase().includes(q) ||
-            m.id.toLowerCase().includes(q) ||
-            (m.group ?? "").toLowerCase().includes(q),
-        );
+      : s.catalog.members.filter((m) => {
+          const info = s.zoneInfo.get(zkey(m.zone));
+          return [
+            m.zone,
+            m.id,
+            m.group ?? "",
+            info?.soaText ?? "",
+            ...(info?.additional ?? []),
+          ]
+            .join(" ")
+            .toLowerCase()
+            .includes(q);
+        });
   } else if (!q) {
     s.view = null;
   } else {
@@ -404,7 +435,9 @@ function applyFilter(s) {
 function updateMeta() {
   const s = cur;
   let meta;
-  if (s.loadingSerial !== null) {
+  if (s.setup) {
+    meta = "no records yet";
+  } else if (s.loadingSerial !== null) {
     meta = "serial " + s.loadingSerial;
   } else {
     meta = "serial " + (s.store.serial ?? "?") + " · ";
@@ -418,6 +451,7 @@ function updateMeta() {
 // Bring the zone view in line with the current session.
 function render() {
   const s = cur;
+  $("toolbar").classList.toggle("setup-active", s.setup !== null);
   const zones = showsZones(s);
   $("zone-view").classList.toggle("catalog-mode", zones);
   $("raw-btn").hidden = s.catalog === null;
@@ -425,7 +459,7 @@ function render() {
   $("add-btn").textContent = zones ? "+ Add zone" : "+ Add record";
   $("filter").placeholder = zones ? "Filter zones…" : "Filter records…";
   updateMeta();
-  if (zones) zlist.setCount(s.zoneView.length);
+  if (zones) zlist.setCount(s.zoneView.length + s.drafts.length);
   else vlist.setCount(s.view ? s.view.length : s.order.length);
 }
 
@@ -515,46 +549,152 @@ function renderRow(i, el) {
 
 // ---- catalog zone list ----
 
+// The catalog view lists the member zones with their SOA and apex NS
+// records. These come from normal queries, made only for the rows on
+// screen (see queueZoneInfo()). Zones without these records (they have no
+// records yet) and zones to be added (see addDraft()) get inputs instead,
+// and a checkmark that creates the zone (see createZone()).
+
+const zkey = (zone) => zone.toLowerCase();
+
+// The rows of the catalog view: the members matching the filter, then the
+// zones to be added.
+function zoneRows(s) {
+  return s.zoneView.concat(s.drafts);
+}
+
 function buildZoneRow(el) {
   el.classList.add("zone-grid");
-  const mk = (tag, cls) => {
-    const s = document.createElement(tag);
-    s.className = cls;
-    el.appendChild(s);
-    return s;
+  const cell = (cls) => {
+    const c = document.createElement("span");
+    c.className = cls;
+    el.appendChild(c);
+    return c;
+  };
+  const add = (parent, tag, cls) => {
+    const e = document.createElement(tag);
+    e.className = cls;
+    parent.appendChild(e);
+    return e;
+  };
+  // Inputs write straight into the row's edit state (a draft, or the
+  // info of a zone without records), which survives scrolling.
+  const input = (parent, cls, key, placeholder) => {
+    const i = add(parent, "input", cls);
+    i.placeholder = placeholder;
+    i.spellcheck = false;
+    i.addEventListener("input", () => (el._edit[key] = i.value));
+    return i;
   };
   const c = {
-    zone: mk("button", "c-zone"),
-    group: mk("span", "c-group"),
-    id: mk("span", "c-id"),
-    actions: mk("span", "c-actions"),
+    zoneCell: cell("c-zone-cell"),
+    groupCell: cell("c-group"),
+    soaCell: cell("c-soa"),
+    nsCell: cell("c-ns"),
+    actions: cell("c-actions"),
   };
-  c.zone.title = "Open zone";
-  c.zone.addEventListener("click", () => openMember(el._member));
-  c.open = document.createElement("button");
-  c.open.className = "row-open";
+  c.zone = add(c.zoneCell, "button", "c-zone");
+  c.zone.addEventListener("click", () => openMember(el._row));
+  c.zoneText = add(c.zoneCell, "span", "c-text");
+  c.zoneInput = input(c.zoneCell, "in-zone", "zone", "zone name");
+  c.groupText = add(c.groupCell, "span", "c-text");
+  c.groupInput = input(c.groupCell, "in-group", "group", "group");
+  c.soaText = add(c.soaCell, "span", "c-text");
+  c.soaInput = input(
+    c.soaCell,
+    "in-soa",
+    "soa",
+    "mname rname serial refresh retry expire minimum",
+  );
+  c.nsText = add(c.nsCell, "span", "c-text");
+  c.nsInput = input(c.nsCell, "in-ns", "ns", "additional nameservers");
+  c.open = add(c.actions, "button", "row-open");
   c.open.textContent = "→";
   c.open.title = "Open zone";
-  c.open.addEventListener("click", () => openMember(el._member));
-  c.del = document.createElement("button");
-  c.del.className = "row-del";
+  c.open.addEventListener("click", () => openMember(el._row));
+  c.check = add(c.actions, "button", "row-check");
+  c.check.textContent = "✓";
+  c.check.addEventListener("click", () => createZone(cur, el._row));
+  c.del = add(c.actions, "button", "row-del");
   c.del.textContent = "✕";
-  c.del.title = "Remove zone from catalog";
-  c.del.addEventListener("click", () => deleteMember(el._member));
-  c.actions.append(c.open, c.del);
+  c.del.addEventListener("click", () => {
+    if (el._row.draft) removeDraft(cur, el._row);
+    else deleteMember(el._row);
+  });
   el._c = c;
+}
+
+// Set an input's value unless it has it already (keeps the caret).
+function setValue(input, value) {
+  if (input.value !== value) input.value = value;
 }
 
 function renderZoneRow(i, el) {
   if (!el._c) buildZoneRow(el);
-  const m = cur.zoneView[i];
-  el._member = m;
+  const s = cur;
+  const row = zoneRows(s)[i];
+  el._row = row;
   const c = el._c;
-  c.zone.textContent = m.zone;
-  c.group.textContent = m.group ?? "";
-  c.group.title = m.group ?? "";
-  c.id.textContent = m.id;
-  c.id.title = m.id;
+  const draft = row.draft === true;
+  const info = draft ? null : (s.zoneInfo.get(zkey(row.zone)) ?? null);
+  if (!draft && !info) queueZoneInfo(s, row.zone);
+  const editing = draft || info?.state === "unset";
+  const holder = draft ? row : info;
+  el._edit = draft ? row : (info?.edit ?? null);
+
+  c.zone.hidden = editing;
+  c.zoneText.hidden = !editing || draft;
+  c.zoneInput.hidden = !draft;
+  c.groupText.hidden = draft;
+  c.groupInput.hidden = !draft;
+  c.soaText.hidden = editing;
+  c.soaInput.hidden = !editing;
+  c.nsText.hidden = editing;
+  c.nsInput.hidden = !editing;
+  c.open.hidden = editing;
+  c.check.hidden = !editing;
+  el.classList.toggle("editing", editing);
+
+  // (Hidden elements get no text, so that a row reads as what it shows.)
+  const title = draft
+    ? ""
+    : row.id === null
+      ? row.zone
+      : row.zone + " (catalog ID " + row.id + ")";
+  c.zone.textContent = editing ? "" : row.zone;
+  c.zone.title = "Open " + title;
+  c.zoneText.textContent = editing && !draft ? row.zone : "";
+  c.zoneText.title = title;
+  c.groupText.textContent = draft ? "" : (row.group ?? "");
+  c.groupText.title = c.groupText.textContent;
+  if (draft) {
+    setValue(c.zoneInput, row.zone);
+    setValue(c.groupInput, row.group);
+  }
+  if (editing) {
+    setValue(c.soaInput, el._edit.soa);
+    setValue(c.nsInput, el._edit.ns);
+    c.soaText.textContent = c.nsText.textContent = "";
+  } else {
+    const soa = !info
+      ? "…"
+      : info.state === "ok"
+        ? info.soaText
+        : info.state === "loading"
+          ? "…"
+          : info.error;
+    c.soaText.textContent = soa;
+    c.soaText.title = soa;
+    const ns = info?.state === "ok" ? info.additional.join(" ") : "";
+    c.nsText.textContent = ns;
+    c.nsText.title = ns;
+  }
+  c.check.title = draft
+    ? "Add the zone to the catalog and create it with these records"
+    : "Create the zone with these records";
+  c.del.title = draft ? "Discard" : "Remove zone from catalog";
+  c.del.hidden = s.setup !== null; // not in a catalog
+  c.check.disabled = c.del.disabled = !!holder?.busy;
 }
 
 $("raw-btn").addEventListener("click", () => {
@@ -562,12 +702,350 @@ $("raw-btn").addEventListener("click", () => {
   applyFilter(cur);
 });
 
+// Remember that a zone row is on screen without its SOA and NS records;
+// they are queried shortly, together with the other rows that appear.
+function queueZoneInfo(s, zone) {
+  s.infoQueue.add(zone);
+  clearTimeout(s.infoTimer);
+  s.infoTimer = setTimeout(() => fetchZoneInfo(s), 100);
+}
+
+// The zones whose rows are currently rendered (on screen or nearly).
+function renderedZones(s) {
+  if (s !== cur || !showsZones(s) || $("zone-view").hidden) return new Set();
+  return new Set(
+    zlist.pool
+      .filter((el) => el.style.display !== "none" && el._row && !el._row.draft)
+      .map((el) => el._row.zone),
+  );
+}
+
+// Query the SOA and NS records of the queued zones that are still on
+// screen (so that scrolling past rows does not query them), all at once.
+async function fetchZoneInfo(s) {
+  const rendered = renderedZones(s);
+  const zones = [...s.infoQueue].filter(
+    (z) => rendered.has(z) && !s.zoneInfo.has(zkey(z)),
+  );
+  s.infoQueue.clear();
+  if (!zones.length) return;
+  for (const z of zones) s.zoneInfo.set(zkey(z), { state: "loading" });
+  let res;
+  try {
+    const questions = zones.flatMap((name) => [
+      { name, type: TYPE_SOA },
+      { name, type: TYPE_NS },
+    ]);
+    res = await withConn((c) => queryAll(c, questions));
+  } catch (err) {
+    for (const z of zones) s.zoneInfo.delete(zkey(z));
+    setStatus(
+      s,
+      "✗ querying SOA and NS records failed: " + err.message,
+      "error",
+    );
+    return;
+  }
+  zones.forEach((z, i) => {
+    s.zoneInfo.set(zkey(z), zoneInfo(res[2 * i], res[2 * i + 1]));
+  });
+  // Zones without records get inputs, prefilled as suggested by the
+  // others (or as entered before).
+  zones.forEach((z) => {
+    const info = s.zoneInfo.get(zkey(z));
+    if (info.state === "unset") {
+      info.edit = s.keptEdits.get(zkey(z)) ?? suggestion(s);
+    }
+  });
+  if (s === cur && showsZones(s)) render();
+}
+
+// The info of a zone from the responses to its SOA and NS queries.
+function zoneInfo(soaResp, nsResp) {
+  const soa =
+    soaResp.rcode === 0 && soaResp.answers.find((rr) => rr.type === TYPE_SOA);
+  if (soa) {
+    const f = soaFields(soa.rdata);
+    const ns =
+      nsResp.rcode === 0
+        ? nsResp.answers.filter((rr) => rr.type === TYPE_NS)
+        : [];
+    const names = ns.map((rr) => readName(rr.rdata, 0)[0]).sort();
+    return {
+      state: "ok",
+      soa: f,
+      soaTtl: soa.ttl,
+      soaText: rdataToText(TYPE_SOA, soa.rdata),
+      // The primary nameserver of the SOA has an NS record anyway.
+      additional: names.filter((n) => zkey(n) !== zkey(f.mname)),
+      nsTtl: ns.length ? ns[0].ttl : soa.ttl,
+    };
+  }
+  if (isUnsetZoneResponse(soaResp)) return { state: "unset", edit: null };
+  return { state: "error", error: rcodeName(soaResp.rcode) };
+}
+
+// Values for a new zone's records: what at least two of the zones on
+// screen share (e.g. the timers, or a provider's nameservers), else
+// defaults. Names are relative to the new zone, so they fit any zone.
+function suggestion(s) {
+  const oks = [...s.zoneInfo.values()].filter((i) => i.state === "ok");
+  const common = (values, fallback) => {
+    const count = new Map();
+    for (const v of values) count.set(v, (count.get(v) ?? 0) + 1);
+    const [value, n] = [...count].sort((a, b) => b[1] - a[1])[0] ?? [];
+    return n >= 2 ? value : fallback;
+  };
+  const timers = common(
+    oks.map((i) =>
+      [i.soa.refresh, i.soa.retry, i.soa.expire, i.soa.minimum].join(" "),
+    ),
+    "7200 3600 1209600 300",
+  );
+  return {
+    soa:
+      common(
+        oks.map((i) => i.soa.mname),
+        "ns1",
+      ) +
+      " " +
+      common(
+        oks.map((i) => i.soa.rname),
+        "hostmaster",
+      ) +
+      " 1 " +
+      timers,
+    ns: common(
+      oks.map((i) => i.additional.join(" ")),
+      "",
+    ),
+    soaTtl: Number(
+      common(
+        oks.map((i) => String(i.soaTtl)),
+        "3600",
+      ),
+    ),
+    nsTtl: Number(
+      common(
+        oks.map((i) => String(i.nsTtl)),
+        "3600",
+      ),
+    ),
+  };
+}
+
+// Forget the SOA and NS records of the zones (e.g. after a refresh), so
+// that they are queried again when on screen. Input made for zones
+// without records is kept.
+function forgetZoneInfo(s) {
+  for (const [k, info] of s.zoneInfo) {
+    if (info.state === "unset" && info.edit) s.keptEdits.set(k, info.edit);
+  }
+  s.zoneInfo = new Map();
+}
+
+// Add a row for a new zone at the bottom of the catalog view, scrolled
+// into view.
+function addDraft(s) {
+  const draft = {
+    draft: true,
+    zone: "",
+    group: "",
+    busy: false,
+    ...suggestion(s),
+  };
+  s.drafts.push(draft);
+  render();
+  const list = $("zone-list");
+  const rows = s.zoneView.length + s.drafts.length;
+  list.scrollTop = Math.max(0, rows * ROW_HEIGHT - list.clientHeight);
+  render(); // the rows for the new scroll position
+  zlist.pool.find((el) => el._row === draft)?._c.zoneInput.focus();
+}
+
+function removeDraft(s, draft) {
+  s.drafts.splice(s.drafts.indexOf(draft), 1);
+  render();
+}
+
+// The checkmark of a row: create the zone with the SOA and NS records
+// entered. A new zone is added to the catalog first; then the server
+// configures it (without records), and the records can be added.
+async function createZone(s, row) {
+  const draft = row.draft === true;
+  let holder = draft ? row : s.zoneInfo.get(zkey(row.zone));
+  const edit = draft ? row : holder.edit;
+  let zone = row.zone;
+  try {
+    holder.busy = true;
+    render();
+    if (draft) {
+      zone = zone.trim().toLowerCase().replace(/\.+$/, "") + ".";
+      if (zone === ".") throw new Error("the zone name must not be empty");
+      nameToWire(zone); // validate
+      if (s.catalog.members.some((m) => zkey(m.zone) === zone)) {
+        throw new Error(zone + " is already in the catalog");
+      }
+    }
+    // The member zone's own key context (tsigKey from the catalog), so
+    // that a key entered for it does not replace the catalog's.
+    const target = s.setup ? s : newSession(zone, s.tsigKey, s.depth + 1);
+    const { updates, prereqs } = zoneSetupUpdates(
+      target.store,
+      textToRdata(TYPE_SOA, edit.soa, (n) => target.store.absolutize(n)),
+      edit.soaTtl,
+      edit.ns.split(/\s+/).filter(Boolean),
+      edit.nsTtl,
+    );
+    if (draft) {
+      const recs = memberRecords(
+        zone,
+        newMemberId(s.catalog),
+        row.group.trim(),
+      );
+      setStatus(s, "Adding " + zone + " to the catalog…");
+      await performUpdate(s, addUpdates(s.store, recs));
+      for (const r of recs) s.store.add(r.name, r.type, r.ttl, r.rdata);
+      // From now on a member row; it keeps the input, should the rest fail.
+      s.drafts.splice(s.drafts.indexOf(row), 1);
+      holder = { state: "unset", busy: true, edit: { ...edit } };
+      delete holder.edit.draft;
+      s.zoneInfo.set(zkey(zone), holder);
+      rebuild(s);
+      setStatus(s, "Waiting for the server to configure " + zone + "…");
+      await waitForZone(zone);
+    }
+    setStatus(s, "Creating " + zone + "…");
+    // An update key that works for the catalog (possibly just entered for
+    // adding the zone) likely works for its zones.
+    if (target !== s) target.updateKey = s.updateKey;
+    await sendZoneSetup(target, updates, prereqs);
+    const dnssec = await dnssecRecords(zone);
+    if (dnssec) showDnssec(zone, dnssec);
+    if (s.setup) {
+      await finishSetup(s);
+      return;
+    }
+    s.zoneInfo.delete(zkey(zone)); // query its records again
+    s.keptEdits.delete(zkey(zone));
+    setStatus(s, "Created " + zone + ".", "ok");
+  } catch (err) {
+    setStatus(s, "✗ creating " + zone + " failed: " + err.message, "error");
+  } finally {
+    holder.busy = false;
+    if (s === cur) render();
+  }
+}
+
+// Wait (up to 10 seconds) until the server has configured a zone just
+// added to the catalog: it is unknown (REFUSED) until then.
+async function waitForZone(zone) {
+  for (let i = 0; ; i++) {
+    try {
+      await withConn((c) => query(c, zone, TYPE_SOA, null, { edns: true }));
+      return; // it even has records already
+    } catch (err) {
+      if (err instanceof DnsError && isUnsetZoneResponse(err.response)) return;
+      if (!(err instanceof DnsError && err.rcode === RCODE_REFUSED)) throw err;
+      if (i === 50) throw new Error("the server has not configured the zone");
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+}
+
+// The update creating a zone: its SOA and apex NS records (the SOA's
+// primary nameserver and `additional` ones; relative names are made
+// absolute in `store`'s zone), only while it has no SOA.
+function zoneSetupUpdates(store, soa, soaTtl, additional, nsTtl) {
+  const apex = store.zoneFqdn;
+  const mname = soaFields(soa).mname;
+  const names = [mname];
+  for (const n of additional) {
+    const abs = store.absolutize(n);
+    nameToWire(abs); // validate
+    if (!names.some((x) => zkey(x) === zkey(abs))) names.push(abs);
+  }
+  return {
+    updates: [
+      { name: apex, type: TYPE_SOA, cls: CLASS_IN, ttl: soaTtl, rdata: soa },
+      ...names.map((n) => ({
+        name: apex,
+        type: TYPE_NS,
+        cls: CLASS_IN,
+        ttl: nsTtl,
+        rdata: nameToWire(n),
+      })),
+    ],
+    // "RRset does not exist" (RFC 2136 Section 2.4.3): do not overwrite
+    // a concurrent setup.
+    prereqs: [
+      {
+        name: apex,
+        type: TYPE_SOA,
+        cls: CLASS_NONE,
+        ttl: 0,
+        rdata: new Uint8Array(0),
+      },
+    ],
+  };
+}
+
+// Send the update creating a zone; somebody else having created it
+// meanwhile is fine as well.
+async function sendZoneSetup(s, updates, prereqs) {
+  try {
+    await performUpdate(s, updates, prereqs);
+  } catch (err) {
+    if (!(err instanceof DnsError && err.rcode === RCODE_YXRRSET)) throw err;
+  }
+}
+
+// The DNSKEY records of `zone` and the DS records for its key signing
+// keys as master file text, or null if it is not signed.
+async function dnssecRecords(apex) {
+  let keys = [];
+  // A signing server adds the keys with the zone, but give it a moment.
+  for (let i = 0; i < 3 && !keys.length; i++) {
+    if (i) await new Promise((r) => setTimeout(r, 300));
+    const answers = await withConn((c) => query(c, apex, TYPE_DNSKEY, null));
+    keys = answers.filter((rr) => rr.type === TYPE_DNSKEY);
+  }
+  if (!keys.length) return null;
+  const line = (rr, type, rdata) =>
+    apex +
+    " " +
+    rr.ttl +
+    " IN " +
+    typeToName(type) +
+    " " +
+    rdataToText(type, rdata);
+  const ds = [];
+  for (const rdata of dsKeys(keys.map((rr) => rr.rdata))) {
+    const rr = keys.find((k) => k.rdata === rdata);
+    ds.push(line(rr, TYPE_DS, await dsRdata(apex, rdata)));
+  }
+  return {
+    ds: ds.join("\n"),
+    dnskey: keys.map((rr) => line(rr, TYPE_DNSKEY, rr.rdata)).join("\n"),
+  };
+}
+
+function showDnssec(zone, { ds, dnskey }) {
+  $("dnssec-zone").textContent = zone;
+  $("dnssec-ds").value = ds;
+  $("dnssec-dnskey").value = dnskey;
+  $("dnssec-dialog").showModal();
+}
+
+$("dnssec-close").addEventListener("click", () => $("dnssec-dialog").close());
+
 // Open a member zone of the current (catalog) session in a new session.
 // The view switches once the zone transfer got going; until then the
 // catalog stays visible. The member zone is first tried with the
 // catalog's transfer key; if the server refuses the transfer, the user may
 // enter another one. Other failures (e.g. no connection) do not depend on
-// the key and are only reported.
+// the key and are only reported; a zone without records gets inputs for
+// them in the catalog view.
 async function openMember(m) {
   const parent = cur;
   if (parent.opening) return;
@@ -583,6 +1061,18 @@ async function openMember(m) {
   try {
     await startLoad(s, onStarted);
   } catch (err) {
+    if (await isUnsetZone(err, m.zone)) {
+      parent.zoneInfo.set(zkey(m.zone), {
+        state: "unset",
+        edit: parent.keptEdits.get(zkey(m.zone)) ?? suggestion(parent),
+      });
+      if (parent === cur) render();
+      setStatus(
+        parent,
+        m.zone + " has no records yet: enter its SOA and NS records.",
+      );
+      return;
+    }
     setStatus(
       parent,
       "✗ opening " + m.zone + " failed: " + err.message,
@@ -629,47 +1119,47 @@ async function deleteMember(m) {
   }
 }
 
-function openZoneDialog() {
-  $("zone-status").textContent = "";
-  $("zone-new-name").value = "";
-  $("zone-new-group").value = "";
-  $("zone-dialog").showModal();
+// ---- zone setup ----
+
+// A zone the server has, but without records (newly created), fails to
+// transfer with SERVFAIL; a normal SOA query tells such zones apart.
+// `c` is the connection to use, if not the shared one.
+async function isUnsetZone(err, zone, c = null) {
+  if (!(err instanceof DnsError && err.rcode === RCODE_SERVFAIL)) return false;
+  const run = (c) => query(c, zone, TYPE_SOA, null, { edns: true });
+  try {
+    await (c ? runOn(c, run) : withConn(run));
+    return false; // the zone has a SOA after all
+  } catch (e) {
+    return e instanceof DnsError && isUnsetZoneResponse(e.response);
+  }
 }
 
-$("zone-cancel").addEventListener("click", () => $("zone-dialog").close());
+// Logged in to a zone without records (without a catalog): the zone
+// view shows its row like the catalog view does, with inputs for its SOA
+// and apex NS records.
+function enterSetup(s) {
+  s.setup = { zone: s.store.zoneFqdn, id: null, group: null };
+  s.zoneInfo.set(zkey(s.setup.zone), { state: "unset", edit: suggestion(s) });
+  s.zoneView = [s.setup];
+  setStatus(s, "The zone has no records yet: enter its SOA and NS records.");
+}
 
-$("zone-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const s = cur;
-  const status = $("zone-status");
-  const btn = $("zone-save");
+// Show the records of the zone just created instead of its row.
+async function finishSetup(s) {
+  s.setup = null;
+  s.zoneInfo = new Map();
+  if (s === cur) render();
   try {
-    btn.disabled = true;
-    status.textContent = "";
-    const zone =
-      $("zone-new-name").value.trim().toLowerCase().replace(/\.+$/, "") + ".";
-    if (zone === ".") throw new Error("zone name must not be empty");
-    nameToWire(zone); // validate
-    if (s.catalog.members.some((m) => m.zone.toLowerCase() === zone)) {
-      throw new Error(zone + " is already in the catalog");
-    }
-    const group = $("zone-new-group").value.trim();
-    const recs = memberRecords(zone, newMemberId(s.catalog), group);
-    const updates = addUpdates(s.store, recs);
-
-    status.textContent = "Sending update…";
-    await performUpdate(s, updates);
-    for (const r of recs) s.store.add(r.name, r.type, r.ttl, r.rdata);
-
-    $("zone-dialog").close();
+    await transferZone(s, (n) =>
+      setStatus(s, "Transferring zone… " + n + " records"),
+    );
     rebuild(s);
-    setStatus(s, "Added " + zone + " to the catalog.", "ok");
+    setStatus(s, "Zone created (serial " + s.store.serial + ").", "ok");
   } catch (err) {
-    status.textContent = "✗ " + err.message;
-  } finally {
-    btn.disabled = false;
+    setStatus(s, "✗ zone transfer failed: " + err.message, "error");
   }
-});
+}
 
 // ---- login ----
 
@@ -738,16 +1228,19 @@ $("login-form").addEventListener("submit", async (e) => {
     // The login conceptually ends with the first successful DNS message:
     // switch to the zone view right away and let the rest of the AXFR
     // report its progress in the bottom status bar, like a reload does.
-    await startLoad(
-      s,
-      () => {
-        if (conn && conn !== c) conn.close();
-        conn = c;
-        settings = { proxy, ns };
-        enterSession(s);
-      },
-      c,
-    );
+    const onStarted = () => {
+      if (conn && conn !== c) conn.close();
+      conn = c;
+      settings = { proxy, ns };
+      enterSession(s);
+    };
+    try {
+      await startLoad(s, onStarted, c);
+    } catch (err) {
+      if (!(await isUnsetZone(err, s.store.zoneFqdn, c))) throw err;
+      enterSetup(s);
+      onStarted();
+    }
   } catch (err) {
     status.textContent = "✗ " + err.message;
     if (c && c !== conn) c.close();
@@ -914,6 +1407,7 @@ $("refresh-btn").addEventListener("click", async () => {
     const msg = await refreshZone(s, (n) =>
       setStatus(s, "Reloading zone… " + n + " records"),
     );
+    forgetZoneInfo(s); // a catalog's zones may have changed as well
     rebuild(s);
     setStatus(s, msg, "ok");
   } catch (err) {
@@ -978,7 +1472,7 @@ for (const t of ADDABLE_TYPES) {
 $("edit-type").addEventListener("change", updateDataHint);
 
 $("add-btn").addEventListener("click", () => {
-  if (showsZones(cur)) openZoneDialog();
+  if (showsZones(cur)) addDraft(cur);
   else openEditor(null);
 });
 $("edit-cancel").addEventListener("click", () => $("edit-dialog").close());

@@ -24,9 +24,17 @@ prerequisite and merged. Other record types are shown read-only as raw RFC 3597
 are hidden.
 
 Catalog zones (RFC 9432) are detected automatically and shown as a list of their
-member zones, which can be filtered, opened, added and removed. A toggle in the
-toolbar switches to the raw records of the catalog zone. Each opened member zone
-gets its own browser history entry, so the back button returns to the catalog.
+member zones with their SOA records and further apex NS records (the SOA's
+primary nameserver has one anyway), which can be filtered, opened and removed.
+The SOA and NS records are queried with normal queries, only for the zones on
+screen. A new zone is entered in a row added at the end of the list, with its
+group, SOA and nameservers; the checkmark adds it to the catalog and creates it
+with these records. Member zones without any records yet (a transfer fails with
+SERVFAIL, and so does a normal SOA query) get the same inputs. If the server
+signs a new zone, the DS records to enter at the parent zone are shown. A toggle
+in the toolbar switches to the raw records of the catalog zone. Each opened
+member zone gets its own browser history entry, so the back button returns to
+the catalog.
 
 The TSIG key given at login is used for all zone transfers and updates. If the
 server rejects an update (for example because the key only grants transfers), a
@@ -37,6 +45,9 @@ key, another key for that zone can be entered.
 Zones are loaded with AXFR. Refreshing a zone requests only the changes since
 the last transfer with IXFR (RFC 1995). If the server cannot provide them with
 IXFR, it sends the full zone (AXFR) instead.
+
+Logging in to a zone without any records yet shows it as a single row like in
+the catalog view, with the same inputs for its SOA and apex NS records.
 
 ## Run
 

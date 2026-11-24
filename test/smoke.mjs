@@ -42,9 +42,13 @@ import {
   sendUpdate,
   query,
   rcodeName,
+  queryAll,
+  ednsErrors,
+  isUnsetZoneResponse,
 } from "../js/dnsops.js";
 import { ZoneStore } from "../js/zonestore.js";
 import { DowsConnection } from "../js/dows.js";
+import { keyTag, isSep, dsRdata, dsKeys } from "../js/dnssec.js";
 import {
   parseCatalog,
   newMemberId,
@@ -1707,6 +1711,140 @@ check(
     globalThis.WebSocket = realWebSocket;
     console.warn = realWarn;
     console.log = realLog;
+  }
+}
+
+// --- zone setup: unset zones, parallel queries, DNSSEC ---
+{
+  const T = (name) => nameToType(name);
+  // RFC 4509 Section 2.2.1 example
+  const dnskey = textToRdata(
+    T("DNSKEY"),
+    "256 3 5 AQOeiiR0GOMYkDshWoSKz9XzfwJr1AYtsmx3TGkJaNXVbfi/2pHm822aJ5iI9BMzNXxeYCmZDRD99WYwYqUSdjMmmAphXdvxegXd/M5+X7OrzKBaMbCVdFLUUh6DhweJBjEVv5f2wwjM9XzcnOf+EPbtG9DMBmADjFDc2w/rljwvFw==",
+  );
+  eq("key tag", keyTag(dnskey), 60485);
+  eq(
+    "DS SHA-256",
+    rdataToText(T("DS"), await dsRdata("DSKEY.example.com.", dnskey)),
+    "60485 5 2 d4b7d520e7bb5f0f67674a0cceb1e3e0614b93c4f9e99b8383f6a1e4469da50a",
+  );
+  const ksk = Uint8Array.of(1, 1, 3, 13, 9);
+  eq("SEP flag", [isSep(ksk), isSep(dnskey)], [true, false]);
+  eq("DS for key signing keys", dsKeys([dnskey, ksk]), [ksk]);
+  eq("DS for all keys without SEP", dsKeys([dnskey]), [dnskey]);
+
+  // responses to a SOA query
+  const resp = (rcode, { answers = 0, ede = null } = {}) => {
+    const w = new Writer();
+    w.u16(1)
+      .u16(0x8000 | rcode)
+      .u16(1)
+      .u16(answers)
+      .u16(0)
+      .u16(ede === null ? 0 : 1);
+    w.name("new.example.").u16(T("SOA")).u16(1);
+    for (let i = 0; i < answers; i++) {
+      const rd = textToRdata(T("SOA"), ". . 1 2 3 4 5");
+      w.name("new.example.")
+        .u16(T("SOA"))
+        .u16(1)
+        .u32(0)
+        .u16(rd.length)
+        .bytes(rd);
+    }
+    if (ede !== null) {
+      // OPT with an unrelated option first, then EDE (code 15)
+      w.u8(0)
+        .u16(41)
+        .u16(1232)
+        .u32(0)
+        .u16(4 + 2 + 4 + 2);
+      w.u16(10).u16(2).u16(0xbeef).u16(15).u16(2).u16(ede);
+    }
+    return parseMessage(w.done());
+  };
+  eq("EDE codes", ednsErrors(resp(2, { ede: 24 })), [24]);
+  eq("no EDE", ednsErrors(resp(2)), []);
+  {
+    // other additional records (e.g. TSIG) are skipped
+    const m = resp(2, { ede: 24 });
+    m.additional.unshift({
+      name: "k.",
+      type: 250,
+      cls: 255,
+      ttl: 0,
+      rdata: new Uint8Array(4),
+    });
+    eq("EDE next to other records", ednsErrors(m), [24]);
+  }
+  check(
+    "unset zone (Knot: SERVFAIL, Invalid Data)",
+    isUnsetZoneResponse(resp(2, { ede: 24 })),
+  );
+  check("unset zone without EDE", isUnsetZoneResponse(resp(2)));
+  check("other EDE is not unset", !isUnsetZoneResponse(resp(2, { ede: 22 })));
+  check("REFUSED is not unset", !isUnsetZoneResponse(resp(5)));
+  check("records are not unset", !isUnsetZoneResponse(resp(2, { answers: 1 })));
+
+  // EDNS queries carry an OPT record
+  {
+    let sent = null;
+    const conn = {
+      send: (m) => (sent = m),
+      recv: async () => {
+        const r = new Uint8Array(sent.subarray(0, 12 + 17));
+        r[2] |= 0x80;
+        r[3] = 2; // SERVFAIL
+        r[11] = 0;
+        return r;
+      },
+    };
+    let err = null;
+    await query(conn, "new.example.", T("SOA"), null, { edns: true }).catch(
+      (e) => (err = e),
+    );
+    const q = parseMessage(sent);
+    eq(
+      "OPT in EDNS query",
+      q.additional.map((rr) => [rr.type, rr.cls]),
+      [[41, 1232]],
+    );
+    eq("SERVFAIL kept with the error", [err.rcode, err.response.rcode], [2, 2]);
+  }
+
+  // many queries in flight, answered out of order (and a stray message)
+  {
+    const queue = [];
+    const sent = [];
+    const answer = (q) => {
+      const p = parseMessage(q);
+      const w = new Writer();
+      w.u16(p.id).u16(0x8400).u16(1).u16(0).u16(0).u16(0);
+      w.name(p.questions[0].name).u16(p.questions[0].type).u16(1);
+      return w.done();
+    };
+    const conn = {
+      send: (m) => sent.push(m),
+      recv: () =>
+        new Promise((resolve) => {
+          // answer the newest query first, after a stray message
+          if (!queue.length && sent.length)
+            queue.push(
+              Uint8Array.of(0, 0, ...new Array(10).fill(0)),
+              ...sent.splice(0).reverse().map(answer),
+            );
+          resolve(queue.shift());
+        }),
+    };
+    const questions = [];
+    for (let i = 0; i < 50; i++)
+      questions.push({ name: `z${i}.example.`, type: T("SOA") });
+    const res = await queryAll(conn, questions, 8);
+    eq(
+      "parallel query results in order",
+      res.map((r) => r.questions[0].name),
+      questions.map((q) => q.name),
+    );
   }
 }
 

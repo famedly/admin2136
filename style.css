@@ -247,7 +247,9 @@ a {
 /* Catalog zones list their member zones instead of the records. */
 .zone-grid {
     display: grid;
-    grid-template-columns: minmax(200px, 3fr) 1fr 1fr 76px;
+    grid-template-columns:
+        minmax(150px, 2fr) minmax(70px, 1fr) minmax(220px, 3fr)
+        minmax(120px, 2fr) 76px;
     gap: 10px;
     align-items: center;
     padding: 0 14px;
@@ -255,7 +257,11 @@ a {
 #zone-view.catalog-mode #list-header,
 #zone-view.catalog-mode #record-list,
 #zone-view:not(.catalog-mode) #zone-header,
-#zone-view:not(.catalog-mode) #zone-list {
+#zone-view:not(.catalog-mode) #zone-list,
+#toolbar.setup-active #filter,
+#toolbar.setup-active #add-btn,
+#toolbar.setup-active #refresh-btn,
+#toolbar.setup-active #raw-btn {
     display: none;
 }
 
@@ -410,4 +416,30 @@ dialog textarea {
     margin: 0 0 16px;
     color: var(--fg-dim);
     overflow-wrap: anywhere;
+}
+
+.vlist-row .c-soa,
+.vlist-row .c-ns {
+    color: var(--fg-dim);
+}
+/* Rows with inputs: zones without records, zones to be added. */
+.vlist-row > span > .c-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.vlist-row > span:has(input:not([hidden])) {
+    overflow: visible;
+}
+.vlist-row input {
+    height: 24px;
+    padding: 1px 6px;
+    font-size: 12px;
+    font-family: var(--mono);
+}
+.vlist-row.editing {
+    background: var(--bg-alt);
+}
+.vlist-row .row-check:hover:not(:disabled) {
+    color: var(--ok);
 }

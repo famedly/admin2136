@@ -59,7 +59,7 @@ SPDX-License-Identifier: AGPL-3.0-or-later
   </div>
   <div id="record-list"></div>
   <div id="zone-header" class="zone-grid">
-    <span>Zone</span><span>Group</span><span>ID</span><span></span>
+    <span>Zone</span><span>Group</span><span>SOA</span><span>Additional NS</span><span></span>
   </div>
   <div id="zone-list"></div>
   <footer id="status-bar" role="status"></footer>
@@ -90,21 +90,15 @@ SPDX-License-Identifier: AGPL-3.0-or-later
   </form>
 </dialog>
 
-<dialog id="zone-dialog">
-  <form id="zone-form" autocomplete="off">
-    <h2>Add zone to catalog</h2>
-    <label>Zone
-      <input id="zone-new-name" required spellcheck="false" placeholder="example.com">
-    </label>
-    <label>Group (optional)
-      <input id="zone-new-group" spellcheck="false">
-    </label>
-    <div class="dialog-buttons">
-      <button type="button" id="zone-cancel">Cancel</button>
-      <button type="submit" id="zone-save">Add</button>
-    </div>
-    <div id="zone-status" class="status" role="status"></div>
-  </form>
+<dialog id="dnssec-dialog">
+  <h2>DNSSEC for <span id="dnssec-zone"></span></h2>
+  <p>The server signs this zone. Enter the DS records at the parent zone
+  (e.g. with your domain registrar) to complete the chain of trust.</p>
+  <label>DS records <textarea id="dnssec-ds" rows="2" readonly spellcheck="false"></textarea></label>
+  <label>DNSKEY records <textarea id="dnssec-dnskey" rows="3" readonly spellcheck="false"></textarea></label>
+  <div class="dialog-buttons">
+    <button type="button" id="dnssec-close">Close</button>
+  </div>
 </dialog>
 
 <dialog id="key-dialog">

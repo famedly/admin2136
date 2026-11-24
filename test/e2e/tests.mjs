@@ -13,6 +13,39 @@ import { MEMBERS } from "./env.mjs";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const re = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Fill in a zone row of the catalog view and click its checkmark: the
+// newest zone to be added (`zone` null), or the zone without records named
+// `zone`. `values` maps input classes (in-zone, in-group, in-soa, in-ns)
+// to values.
+async function fillZoneRow(t, zone, values, check = true) {
+  const ok = await t.b.ev(`
+    const rows = [...document.querySelectorAll("#zone-list .vlist-row.editing")]
+      .filter((r) => r.style.display !== "none")
+      .sort((a, b) => parseInt(a.style.top) - parseInt(b.style.top));
+    const zone = ${JSON.stringify(zone)};
+    const row = zone === null
+      ? rows.filter((r) => !r.querySelector(".in-zone").hidden).pop()
+      : rows.find((r) => r.querySelector(".c-zone-cell .c-text").textContent === zone);
+    if (!row) return false;
+    for (const [cls, v] of Object.entries(${JSON.stringify(values)})) {
+      const i = row.querySelector("." + cls);
+      i.value = v;
+      i.dispatchEvent(new Event("input"));
+    }
+    if (${check}) row.querySelector(".row-check").click();
+    return true;`);
+  if (!ok) throw new Error("no zone row " + zone);
+}
+
+// Wait until the SOA records of the catalog view's zones are shown.
+const soaShown = (b) =>
+  b.wait(
+    `[...document.querySelectorAll("#zone-list .vlist-row:not(.editing)")]
+      .filter((r) => r.style.display !== "none")
+      .every((r) => r.querySelector(".c-soa").textContent !== "…")`,
+    "SOA records shown",
+  );
+
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
 export default tests;
@@ -141,14 +174,31 @@ test("catalog: member zones, filter, raw records", async (t) => {
     ),
     "catalog mode",
   );
+  await soaShown(b);
   const zones = await t.rows("zone-list");
   const expected = [...MEMBERS]
     .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([zone, group, id]) => [zone + ".", group, id]);
+    .map(([zone, group]) => [zone + ".", group]);
   t.eq(
-    zones.filter((z) => expected.some((e) => e[0] === z[0])),
+    zones
+      .filter((z) => expected.some((e) => e[0] === z[0]))
+      .map((z) => z.slice(0, 2)),
     expected,
     "member zones",
+  );
+  for (const [zone, , soa] of zones.filter((z) =>
+    expected.some((e) => e[0] === z[0]),
+  )) {
+    t.ok(
+      soa.startsWith("ns1." + zone + " hostmaster." + zone),
+      "SOA of " + zone + ": " + soa,
+    );
+  }
+  t.ok(
+    await b.ev(`return [...document.querySelectorAll("#zone-list .vlist-row")]
+      .find((r) => r.children[0].textContent === "big.example.")
+      .querySelector(".c-zone").title.includes("catalog ID big");`),
+    "catalog ID in the tooltip",
   );
   t.ok(
     (await t.text("zone-meta")).includes("catalog of"),
@@ -169,6 +219,7 @@ test("catalog: member zones, filter, raw records", async (t) => {
   t.eq(await filtered("own"), ["own.example."], "filter by name");
   t.eq(await filtered("AXFR-only"), ["xfr.example."], "filter by group");
   t.eq(await filtered("big"), ["big.example."], "filter by id");
+  t.eq(await filtered("hostmaster.own"), ["own.example."], "filter by SOA");
   t.ok((await filtered("")).length >= MEMBERS.length, "filter cleared");
 
   // raw records of the catalog zone
@@ -204,25 +255,56 @@ test("catalog: member zones, filter, raw records", async (t) => {
 test("catalog: add and remove zones", async (t) => {
   const { b, env } = t;
   await t.login("catalog.test");
-  const addZone = async (name, group, expect) => {
+  await soaShown(b);
+  const addZone = async (values, expect) => {
+    await t.clearStatus();
     await t.click("add-btn");
-    t.ok(
-      await b.ev(`return document.getElementById("zone-dialog").open;`),
-      "zone dialog",
+    await b.wait(
+      `document.activeElement.classList.contains("in-zone")`,
+      "new row focused",
     );
-    await t.set("zone-new-name", name);
-    await t.set("zone-new-group", group);
-    await t.click("zone-save");
-    return b.wait(
-      `(${expect ? `/${expect}/.test(document.getElementById("zone-status").textContent)` : `!document.getElementById("zone-dialog").open`}) && true`,
-      "add zone " + name,
-    );
+    await fillZoneRow(t, null, values);
+    return t.waitStatus(expect);
   };
-  await addZone("Added.Example.", "full");
-  t.ok(
-    (await t.rows("zone-list")).some(
-      (r) => r[0] === "added.example." && r[1] === "full",
+  // prefilled with the settings the other zones share
+  await t.click("add-btn");
+  t.eq(
+    await b.ev(
+      `return document.activeElement.closest(".vlist-row").querySelector(".in-soa").value;`,
     ),
+    "ns1 hostmaster 1 3600 600 86400 300",
+    "suggested SOA",
+  );
+  await b.ev(
+    `document.activeElement.closest(".vlist-row").querySelector(".row-del").click();`,
+  );
+  t.ok(
+    !(await b.ev(
+      `return [...document.querySelectorAll("#zone-list .vlist-row")]
+        .some((r) => r.style.display !== "none" && !r.querySelector(".in-zone").hidden);`,
+    )),
+    "row discarded",
+  );
+
+  await addZone(
+    {
+      "in-zone": "Added.Example.",
+      "in-group": "full",
+      "in-ns": "ns2.example.net.",
+    },
+    "^Created added\\.example\\.",
+  );
+  await soaShown(b);
+  const added = (await t.rows("zone-list")).find(
+    (r) => r[0] === "added.example.",
+  );
+  t.eq(
+    added,
+    [
+      "added.example.",
+      "full",
+      "ns1.added.example. hostmaster.added.example. 1 3600 600 86400 300",
+    ],
     "new zone listed",
   );
   const catalog = await env.records("catalog.test");
@@ -233,20 +315,64 @@ test("catalog: add and remove zones", async (t) => {
     catalog.some((r) => r[0] === `group.${id}.zones` && r[3] === '"full"'),
     "group on the server",
   );
-
-  // a zone without group
-  await addZone("nogroup.example", "");
+  t.eq(
+    (await env.records("added.example"))
+      .filter((r) => r[2] === "NS")
+      .map((r) => r[3])
+      .sort(),
+    ["ns1.added.example.", "ns2.example.net."],
+    "NS records on the server",
+  );
   t.ok(
-    (await t.rows("zone-list")).some(
-      (r) => r[0] === "nogroup.example." && r[1] === "",
-    ),
-    "zone without group",
+    await b.ev(`return [...document.querySelectorAll("#zone-list .vlist-row")]
+      .find((r) => r.children[0].textContent === "added.example.").querySelector(".c-ns").textContent
+      === "ns2.example.net.";`),
+    "additional NS shown",
   );
 
-  await addZone("added.example", "", "already in the catalog");
-  await addZone(".", "", "must not be empty");
-  await addZone("a..b", "", "empty label");
-  await t.click("zone-cancel");
+  // a zone without group, with its own SOA
+  await addZone(
+    {
+      "in-zone": "nogroup.example",
+      "in-soa": "ns.example.net. admin.example.net. 5 3600 600 86400 60",
+    },
+    "^Created nogroup",
+  );
+  await soaShown(b);
+  t.eq(
+    (await t.rows("zone-list")).find((r) => r[0] === "nogroup.example."),
+    [
+      "nogroup.example.",
+      "",
+      "ns.example.net. admin.example.net. 5 3600 600 86400 60",
+    ],
+    "zone without group",
+  );
+  t.eq(
+    (await env.records("nogroup.example"))
+      .filter((r) => r[2] === "NS")
+      .map((r) => r[3]),
+    ["ns.example.net."],
+    "the primary nameserver gets its NS record",
+  );
+
+  // errors keep the row
+  await addZone({ "in-zone": "added.example" }, "already in the catalog");
+  for (const [values, error] of [
+    [{ "in-zone": "." }, "must not be empty"],
+    [{ "in-zone": "a..b" }, "empty label"],
+    [
+      { "in-zone": "bad.example", "in-soa": "ns1 hostmaster" },
+      "invalid SOA data",
+    ],
+    [{ "in-soa": "ns1 hostmaster 1 2 3 4 5", "in-ns": "x..y" }, "empty label"],
+  ]) {
+    await t.clearStatus();
+    await fillZoneRow(t, null, values);
+    await t.waitStatus(error);
+  }
+  await b.ev(`[...document.querySelectorAll("#zone-list .vlist-row.editing")]
+    .find((r) => !r.querySelector(".in-zone").hidden).querySelector(".row-del").click();`);
 
   // removal: dismissed, then confirmed
   b.acceptDialogs = false;
@@ -608,6 +734,8 @@ test("keys: update rejected, separate update key", async (t) => {
 test("keys: member zone with its own key", async (t) => {
   const { b, env } = t;
   await t.login("catalog.test");
+  await soaShown(b); // before the proxy is gone, so that their failure
+  // does not replace the status of opening the zone
 
   // no response at all (the proxy is gone): another key would not help,
   // so there is no prompt, just the error
@@ -828,25 +956,21 @@ test("catalog: rejected catalog updates, groupless members", async (t) => {
   // ku may transfer the catalog, but not update it
   await t.login("catalog.test", "ku");
   await t.click("add-btn");
-  await t.set("zone-new-name", "keyed.example");
-  await t.set("zone-new-group", "x".repeat(300));
-  await t.click("zone-save");
-  await b.wait(
-    `document.getElementById("zone-status").textContent.includes("exceeds 255 bytes")`,
-    "group too long",
-  );
-  await t.set("zone-new-group", "");
-  await t.click("zone-save");
+  await fillZoneRow(t, null, {
+    "in-zone": "keyed.example",
+    "in-group": "x".repeat(300),
+  });
+  await t.waitStatus("exceeds 255 bytes");
+  await t.clearStatus();
+  await fillZoneRow(t, null, { "in-group": "" });
   await b.wait(
     `document.getElementById("key-dialog").open`,
     "key prompt for the catalog",
   );
   await t.set("key-input", env.spec("kc"));
   await t.click("key-submit");
-  await b.wait(
-    `!document.getElementById("zone-dialog").open`,
-    "zone added with kc",
-  );
+  // the zone's records are added with the catalog's update key as well
+  await t.waitStatus("^Created keyed\\.example\\.");
   t.ok(
     (await t.rows("zone-list")).some(
       (r) => r[0] === "keyed.example." && r[1] === "",
@@ -1090,12 +1214,16 @@ test("edge cases: concurrent actions", async (t) => {
   await t.click("key-cancel");
   await sleep(300);
   await t.click("add-btn");
-  await t.set("zone-new-name", "concurrent.example");
-  await b.ev(
-    `document.getElementById("refresh-btn").click(); document.getElementById("zone-save").click();`,
+  await fillZoneRow(t, null, { "in-zone": "concurrent.example" }, false);
+  await b.ev(`document.getElementById("refresh-btn").click();
+    [...document.querySelectorAll("#zone-list .vlist-row.editing")]
+      .find((r) => !r.querySelector(".in-zone").hidden).querySelector(".row-check").click();`);
+  await b.wait(
+    `[...document.querySelectorAll("#zone-list .vlist-row")].some((r) =>
+      r.children[0].textContent === "concurrent.example."
+      && r.querySelector(".c-soa").textContent.startsWith("ns1.concurrent.example."))`,
+    "zone created",
   );
-  await b.wait(`!document.getElementById("zone-dialog").open`, "zone added");
-  await t.waitStatus("up to date|Added concurrent");
   await t.rowAction("zone-list", ["concurrent.example."], "row-del");
   await t.waitStatus("Removed concurrent.example.");
 });
@@ -1231,4 +1359,313 @@ test("connection lost: interrupted transfer, reconnect", async (t) => {
     "filtered",
   );
   await t.deleteRecord(["reconnect", null, "A"]);
+});
+
+// ---- setting up new zones ----
+
+// Add a member zone without records to the catalog; resolves once Knot
+// has configured it (a SOA query then fails with SERVFAIL).
+async function newMember(env, zone, group) {
+  const id = zone.split(".")[0];
+  await env.knsupdate("catalog.test", [
+    `update add ${id}.zones.catalog.test. 0 PTR ${zone}.`,
+    `update add group.${id}.zones.catalog.test. 0 TXT "${group}"`,
+  ]);
+  for (let i = 0; i < 100; i++) {
+    if ((await env.kdig(["SOA", zone], null)).includes("status: SERVFAIL"))
+      return;
+    await sleep(100);
+  }
+  throw new Error(zone + " not configured");
+}
+
+// The zone view of a zone without records: its single row with inputs.
+const setupShown = (b, zone) =>
+  b.wait(
+    `document.getElementById("zone-view").classList.contains("catalog-mode")
+    && [...document.querySelectorAll("#zone-list .vlist-row")]
+      .filter((r) => r.style.display !== "none")
+      .map((r) => r.classList.contains("editing")
+        && r.querySelector(".c-zone-cell .c-text").textContent).join() === ${JSON.stringify(zone)}`,
+    "row of the zone without records",
+  );
+
+test("setup: zones without records in the catalog view", async (t) => {
+  const { b, env } = t;
+  await newMember(env, "fresh1.example", "full");
+  await t.login("catalog.test");
+  await b.wait(
+    `[...document.querySelectorAll("#zone-list .vlist-row.editing")]
+      .some((r) => r.querySelector(".c-zone-cell .c-text").textContent === "fresh1.example.")`,
+    "inputs for the zone without records",
+  );
+  t.ok(
+    !(await b.ev(`return document.getElementById("key-dialog").open;`)),
+    "no key prompt",
+  );
+  const row = `[...document.querySelectorAll("#zone-list .vlist-row.editing")]
+    .find((r) => r.querySelector(".c-zone-cell .c-text").textContent === "fresh1.example.")`;
+  t.eq(
+    await b.ev(`const r = ${row}; return [r.querySelector(".c-group").textContent,
+      r.querySelector(".in-soa").value, r.querySelector(".row-open").hidden,
+      r.querySelector(".row-check").hidden, r.querySelector(".in-zone").hidden];`),
+    ["full", "ns1 hostmaster 1 3600 600 86400 300", true, false, true],
+    "row of a zone without records",
+  );
+  // input is kept across a refresh
+  await fillZoneRow(
+    t,
+    "fresh1.example.",
+    { "in-soa": "ns1 admin 1 3600 600 86400 300", "in-ns": "ns2.example.net." },
+    false,
+  );
+  await t.refresh();
+  await b.wait(
+    `${row}?.querySelector(".in-soa").value === "ns1 admin 1 3600 600 86400 300"`,
+    "input kept",
+  );
+
+  await t.clearStatus();
+  await fillZoneRow(t, "fresh1.example.", {});
+  await t.waitStatus("^Created fresh1\\.example\\.");
+  await soaShown(b);
+  t.eq(
+    (await t.rows("zone-list")).find((r) => r[0] === "fresh1.example."),
+    [
+      "fresh1.example.",
+      "full",
+      "ns1.fresh1.example. admin.fresh1.example. 1 3600 600 86400 300",
+    ],
+    "created",
+  );
+  await t.rowAction("zone-list", ["fresh1.example."], "c-zone");
+  await b.wait(
+    `document.getElementById("zone-name").textContent === "fresh1.example."`,
+    "opened",
+  );
+  await t.waitStatus("Zone loaded");
+  await t.expectInSync("fresh1.example", "kc", { withSoa: true });
+  t.eq(
+    (await t.rows())
+      .filter((r) => r[2] === "NS")
+      .map((r) => r[3])
+      .sort(),
+    ["ns1.fresh1.example.", "ns2.example.net."],
+    "NS records",
+  );
+});
+
+test("setup: direct login, input errors, concurrent setup", async (t) => {
+  const { b, env } = t;
+  await newMember(env, "fresh2.example", "full");
+  await t.open();
+  await t.submitLogin({ zone: "fresh2.example" });
+  await setupShown(b, "fresh2.example.");
+  const row = `[...document.querySelectorAll("#zone-list .vlist-row")]
+    .find((r) => r.style.display !== "none")`;
+  t.eq(
+    await b.ev(`const r = ${row}; return [r.querySelector(".in-soa").value,
+      r.querySelector(".in-ns").value, r.querySelector(".c-group").textContent,
+      r.querySelector(".c-zone-cell .c-text").title,
+      r.querySelector(".row-check").hidden, r.querySelector(".row-del").hidden,
+      r.querySelector(".in-zone").hidden];`),
+    ["ns1 hostmaster 1 7200 3600 1209600 300", "", "", "fresh2.example.",
+      false, true, true],
+    "defaults, no removal",
+  );
+  t.ok(
+    await b.ev(`return ["filter", "add-btn", "refresh-btn", "raw-btn"]
+      .every((id) => getComputedStyle(document.getElementById(id)).display === "none");`),
+    "no list tools",
+  );
+  const bad = async (soa, ns, pattern) => {
+    await t.clearStatus();
+    await fillZoneRow(t, "fresh2.example.", { "in-soa": soa, "in-ns": ns });
+    await t.waitStatus(pattern);
+  };
+  await bad("ns1 hostmaster 1 3600 -1 86400 300", "", "✗ creating fresh2\\.example\\. failed");
+  await bad("ns1 hostmaster", "", "✗ creating fresh2\\.example\\. failed");
+  await bad("a..b hostmaster 1 3600 600 86400 300", "", "empty label");
+  await bad("ns1 hostmaster 1 3600 600 86400 300", "x..y", "empty label");
+  await fillZoneRow(
+    t,
+    "fresh2.example.",
+    { "in-soa": "ns1 admin 1 3600 600 86400 300", "in-ns": "" },
+    false,
+  );
+  // the input is kept across navigation
+  await b.ev(`history.back();`);
+  await b.wait(`!document.getElementById("login-view").hidden`, "login");
+  await b.ev(`history.forward();`);
+  await setupShown(b, "fresh2.example.");
+  t.eq(
+    await b.ev(`return ${row}.querySelector(".in-soa").value;`),
+    "ns1 admin 1 3600 600 86400 300",
+    "input kept",
+  );
+
+  // someone else sets it up first: the prerequisite fails, the zone loads
+  await env.knsupdate("fresh2.example", [
+    "update add fresh2.example. 3600 SOA ns.other. h.other. 7 3600 600 86400 300",
+    "update add fresh2.example. 3600 NS ns.other.",
+  ]);
+  await fillZoneRow(t, "fresh2.example.", {});
+  await t.waitStatus("Zone created \\(serial 7\\)");
+  t.eq(
+    (await t.rows()).find((r) => r[2] === "NS")[3],
+    "ns.other.",
+    "the other setup",
+  );
+});
+
+test("setup: a signed zone shows its DS records", async (t) => {
+  const { b, env } = t;
+  await t.login("catalog.test");
+  await t.click("add-btn");
+  await fillZoneRow(t, null, {
+    "in-zone": "fresh3.example",
+    "in-group": "signed",
+  });
+  await b.wait(
+    `document.getElementById("dnssec-dialog").open`,
+    "DNSSEC records",
+  );
+  t.eq(await t.text("dnssec-zone"), "fresh3.example.", "zone");
+  const ds = (await t.value("dnssec-ds")).split("\n");
+  const dnskey = (await t.value("dnssec-dnskey")).split("\n");
+  t.ok(
+    dnskey.length >= 1 && dnskey.every((l) => / IN DNSKEY /.test(l)),
+    "DNSKEY: " + dnskey,
+  );
+  // the same DS (SHA-256) as Knot computes
+  const { stdout } = await env.keymgr("fresh3.example", "ds");
+  const expected = stdout
+    .trim()
+    .split("\n")
+    .map((l) => l.trim().split(/\s+/))
+    .filter((f) => f[f.length - 2] === "2")
+    .map((f) => f.slice(-4).join(" ").toLowerCase());
+  t.eq(
+    ds.map((l) => l.split(" IN DS ")[1].toLowerCase()),
+    expected,
+    "DS records",
+  );
+  await t.click("dnssec-close");
+  await soaShown(b);
+  t.ok(
+    (await t.rows("zone-list"))
+      .find((r) => r[0] === "fresh3.example.")[2]
+      .startsWith("ns1.fresh3.example."),
+    "created",
+  );
+
+  // the row of a directly logged in zone shows them as well
+  await newMember(env, "fresh4.example", "signed");
+  await t.open();
+  await t.submitLogin({ zone: "fresh4.example" });
+  await setupShown(b, "fresh4.example.");
+  await fillZoneRow(t, "fresh4.example.", {});
+  await b.wait(
+    `document.getElementById("dnssec-dialog").open`,
+    "DNSSEC records after setup",
+  );
+  await t.click("dnssec-close");
+  await t.waitStatus("Zone created \\(serial");
+  t.ok(
+    (await t.rows()).some((r) => r[2] === "DNSKEY"),
+    "zone with its keys",
+  );
+});
+
+test("setup: the zone goes away before it is created", async (t) => {
+  const { b, env } = t;
+  await newMember(env, "fresh5.example", "full");
+  await t.login("catalog.test");
+  await b.wait(
+    `[...document.querySelectorAll("#zone-list .vlist-row.editing")]
+      .some((r) => r.querySelector(".c-zone-cell .c-text").textContent === "fresh5.example.")`,
+    "inputs",
+  );
+  await env.knsupdate("catalog.test", [
+    "update delete fresh5.zones.catalog.test.",
+  ]);
+  for (let i = 0; i < 100; i++) {
+    if (
+      (await env.kdig(["SOA", "fresh5.example"], null)).includes(
+        "status: REFUSED",
+      )
+    )
+      break;
+    await sleep(100);
+  }
+  await fillZoneRow(t, "fresh5.example.", {});
+  // the server is no longer authoritative: the key may be wrong as well
+  await b.wait(
+    `document.getElementById("key-dialog").open`,
+    "key prompt for NOTAUTH",
+  );
+  await t.click("key-cancel");
+  await t.waitStatus(
+    "✗ creating fresh5.example. failed: update failed: NOTAUTH",
+  );
+});
+
+test("catalog: SOA and NS records are only queried for rows on screen", async (t) => {
+  const { b, env } = t;
+  const lines = [];
+  for (let i = 0; i < 300; i++) {
+    lines.push(
+      `update add many${i}.zones.catalog.test. 0 PTR many${i}.example.`,
+    );
+  }
+  await env.knsupdate("catalog.test", lines);
+  try {
+    await t.open();
+    // count the DNS messages the page sends
+    await b.ev(`window.sentMessages = 0;
+      const send = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (data) {
+        window.sentMessages++;
+        return send.call(this, data);
+      };`);
+    await t.submitLogin({ zone: "catalog.test" });
+    await t.waitStatus("Zone loaded");
+    const rendered = () =>
+      b.ev(`return [...document.querySelectorAll("#zone-list .vlist-row")]
+        .filter((r) => r.style.display !== "none").length;`);
+    const settled = async () => {
+      await sleep(300);
+      await soaShown(b);
+    };
+    await settled();
+    const n = await rendered();
+    const first = await b.ev(`return window.sentMessages;`);
+    // the AXFR, plus SOA and NS for each rendered row
+    t.ok(
+      n < 60 && first <= 1 + 2 * n,
+      `${first} messages for ${n} of 305 rows`,
+    );
+
+    // jumping past the middle to the end: only the rows that stay on
+    // screen are queried
+    await b.ev(`const l = document.getElementById("zone-list");
+      l.scrollTop = l.scrollHeight / 2;
+      l.dispatchEvent(new Event("scroll"));
+      l.scrollTop = l.scrollHeight;`);
+    await settled();
+    const second = await b.ev(`return window.sentMessages;`);
+    t.ok(
+      second > first && second - first <= 2 * n,
+      `${second - first} more messages`,
+    );
+    const last = (await t.rows("zone-list")).at(-1);
+    t.eq(last[0], "xfr.example.", "scrolled to the end");
+  } finally {
+    await env.knsupdate(
+      "catalog.test",
+      lines.map((l) =>
+        l.replace("update add", "update delete").replace(/ 0 PTR .*/, ""),
+      ),
+    );
+  }
 });
