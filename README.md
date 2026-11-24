@@ -34,7 +34,9 @@ SERVFAIL, and so does a normal SOA query) get the same inputs. If the server
 signs a new zone, the DS records to enter at the parent zone are shown. A toggle
 in the toolbar switches to the raw records of the catalog zone. Each opened
 member zone gets its own browser history entry, so the back button returns to
-the catalog.
+the catalog. The toolbar shows the path from the catalog to the member zone;
+clicking the catalog goes back to it, and clicking admin2136 goes back to the
+login form.
 
 The TSIG key given at login is used for all zone transfers and updates. If the
 server rejects an update (for example because the key only grants transfers), a

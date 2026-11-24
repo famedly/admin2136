@@ -10,6 +10,10 @@ import fs from "node:fs";
 
 import { MEMBERS } from "./env.mjs";
 
+// The name shown last in the toolbar path (the catalog in the catalog
+// view, else the zone), as a page expression.
+const SHOWN = `[...document.querySelectorAll("#path .path-part:not([hidden]) .path-name")].pop().textContent`;
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const re = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -45,6 +49,14 @@ const soaShown = (b) =>
       .every((r) => r.querySelector(".c-soa").textContent !== "…")`,
     "SOA records shown",
   );
+
+// The visible parts of the toolbar path as [name, line below].
+const path = (b) =>
+  b.ev(`return [...document.querySelectorAll("#path .path-part:not([hidden])")]
+    .map((p) => [...p.children].map((c) => c.textContent));`);
+const catalogBox = (b) =>
+  b.ev(`const r = document.getElementById("catalog-name").getBoundingClientRect();
+    return [r.x, r.y, r.width, r.height];`);
 
 const tests = [];
 const test = (name, fn) => tests.push([name, fn]);
@@ -201,8 +213,8 @@ test("catalog: member zones, filter, raw records", async (t) => {
     "catalog ID in the tooltip",
   );
   t.ok(
-    (await t.text("zone-meta")).includes("catalog of"),
-    "meta: " + (await t.text("zone-meta")),
+    (await t.text("catalog-meta")).includes("catalog of"),
+    "meta: " + (await t.text("catalog-meta")),
   );
   t.eq(await t.text("add-btn"), "+ Add zone", "add button");
   t.eq(
@@ -409,9 +421,17 @@ test("catalog: member zones and history navigation", async (t) => {
     "catalog entry",
   );
 
+  const catalogMeta = await t.text("catalog-meta");
+  t.ok(/^serial \d+ · catalog of \d+ zones$/.test(catalogMeta), catalogMeta);
+  t.eq(
+    (await path(b)).map((p) => p[0]),
+    ["admin2136", "catalog.test."],
+    "path of the catalog",
+  );
+  const catalogAt = await catalogBox(b);
   await t.rowAction("zone-list", ["full.example."], "c-zone");
   await b.wait(
-    `document.getElementById("zone-name").textContent === "full.example."`,
+    `${SHOWN} === "full.example."`,
     "member",
   );
   await t.waitStatus("Zone loaded");
@@ -424,13 +444,47 @@ test("catalog: member zones and history navigation", async (t) => {
     await b.ev(`return document.getElementById("raw-btn").hidden;`),
     "no raw toggle",
   );
-
-  await b.ev(`history.back();`);
+  // the path keeps the catalog (in place) and adds the zone; the catalog
+  // leads back
+  const memberPath = await path(b);
+  t.eq(
+    memberPath.slice(0, 2).map((p) => p[0]).concat([memberPath[1][1]]),
+    ["admin2136", "catalog.test.", catalogMeta],
+    "path of a member zone: the catalog as it was",
+  );
+  t.eq(memberPath[2][0], "full.example.", "and the zone");
+  t.ok(/^serial \d+ · \d+ records$/.test(memberPath[2][1]), memberPath[2][1]);
+  t.eq(await catalogBox(b), catalogAt, "the catalog stays in place");
+  await b.ev(`document.getElementById("catalog-title").click();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."
+    `${SHOWN} === "catalog.test."
     && document.getElementById("zone-view").classList.contains("catalog-mode")`,
     "back to catalog",
   );
+  t.eq(await b.ev(`return history.state.depth;`), 0, "catalog entry again");
+  t.eq((await path(b)).length, 2, "no zone in the path");
+  // clicking the catalog in the catalog view does nothing
+  await b.ev(`document.getElementById("catalog-title").click();`);
+  await sleep(100);
+  t.eq(await b.ev(`return history.state.depth;`), 0, "still the catalog");
+  // its raw records show it as a zone
+  await t.click("raw-btn");
+  t.eq(
+    (await path(b)).map((p) => p[0]),
+    ["admin2136", "catalog.test."],
+    "raw records path",
+  );
+  t.ok(
+    await b.ev(`return document.getElementById("catalog-title").hidden
+      && !document.getElementById("zone-title").hidden;`),
+    "as a zone",
+  );
+  t.ok(
+    (await b.ev(`return document.getElementById("zone-meta").textContent;`))
+      .endsWith(" records"),
+    "record count",
+  );
+  await t.click("raw-btn");
   await b.ev(`history.back();`);
   await b.wait(
     `!document.getElementById("login-view").hidden`,
@@ -440,38 +494,42 @@ test("catalog: member zones and history navigation", async (t) => {
   await t.set("zone", "changed.example");
   await b.ev(`history.forward();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."
+    `${SHOWN} === "catalog.test."
     && !document.getElementById("zone-view").hidden`,
     "forward to catalog",
   );
   await b.ev(`history.forward();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "full.example."`,
+    `${SHOWN} === "full.example."`,
     "forward to member",
   );
-  await b.ev(`history.go(-2);`);
+  // the brand leads back to the login form
+  await b.ev(`document.getElementById("brand").click();`);
   await b.wait(`!document.getElementById("login-view").hidden`, "login again");
+  await b.ev(`document.getElementById("brand").click();`); // no effect here
+  await sleep(100);
+  t.eq(await b.ev(`return history.state;`), null, "first entry");
   t.eq(await t.value("zone"), "catalog.test", "login form restored");
   await b.ev(`history.forward();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."`,
+    `${SHOWN} === "catalog.test."`,
     "catalog again",
   );
 
   // opening another member replaces the forward history
   await t.rowAction("zone-list", ["big.example."], "row-open");
   await b.wait(
-    `document.getElementById("zone-name").textContent === "big.example."`,
+    `${SHOWN} === "big.example."`,
     "big",
   );
   await b.ev(`history.back();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."`,
+    `${SHOWN} === "catalog.test."`,
     "catalog",
   );
   await b.ev(`history.forward();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "big.example."`,
+    `${SHOWN} === "big.example."`,
     "big again",
   );
 
@@ -770,7 +828,7 @@ test("keys: member zone with its own key", async (t) => {
   await t.set("key-input", env.spec("kz"));
   await t.click("key-submit");
   await b.wait(
-    `document.getElementById("zone-name").textContent === "own.example."`,
+    `${SHOWN} === "own.example."`,
     "opened",
   );
   await t.waitStatus("Zone loaded");
@@ -1155,7 +1213,7 @@ test("edge cases: settings, insecure context, bypassed form validation", async (
   // logging in again replaces the connection of the previous login
   await t.submitLogin({ zone: "xfr.example" });
   await b.wait(
-    `document.getElementById("zone-name").textContent === "xfr.example."`,
+    `${SHOWN} === "xfr.example."`,
     "second login",
   );
   await t.waitStatus("Zone loaded");
@@ -1170,13 +1228,13 @@ test("edge cases: concurrent actions", async (t) => {
     row.querySelector(".row-open").click();
     row.querySelector(".c-zone").click();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "full.example."`,
+    `${SHOWN} === "full.example."`,
     "opened",
   );
   t.eq(await b.ev(`return history.state.depth;`), 1, "one history entry");
   await b.ev(`history.back();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."`,
+    `${SHOWN} === "catalog.test."`,
     "catalog",
   );
 
@@ -1191,7 +1249,7 @@ test("edge cases: concurrent actions", async (t) => {
   t.ok(await t.visible("login-view"), "not taken to the member zone");
   await b.ev(`history.forward();`);
   await b.wait(
-    `document.getElementById("zone-name").textContent === "catalog.test."`,
+    `${SHOWN} === "catalog.test."`,
     "catalog again",
   );
 
@@ -1440,7 +1498,7 @@ test("setup: zones without records in the catalog view", async (t) => {
   );
   await t.rowAction("zone-list", ["fresh1.example."], "c-zone");
   await b.wait(
-    `document.getElementById("zone-name").textContent === "fresh1.example."`,
+    `${SHOWN} === "fresh1.example."`,
     "opened",
   );
   await t.waitStatus("Zone loaded");

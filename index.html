@@ -15,15 +15,22 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <body>
 
 <header id="toolbar">
-  <div id="brand">
-    <span id="brand-name">admin2136</span>
-    <span id="brand-sub">AXFR / RFC&nbsp;2136 zone editor</span>
-  </div>
-  <span id="brand-sep" class="zone-only">/</span>
-  <div id="zone-title" class="zone-only">
-    <span id="zone-name"></span>
-    <span id="zone-meta"></span>
-  </div>
+  <nav id="path">
+    <div id="brand" class="path-part">
+      <span id="brand-name" class="path-name">admin2136</span>
+      <span id="brand-sub" class="path-meta">AXFR / RFC&nbsp;2136 zone editor</span>
+    </div>
+    <span id="catalog-sep" class="path-sep zone-only" hidden>/</span>
+    <div id="catalog-title" class="path-part zone-only" hidden>
+      <span id="catalog-name" class="path-name"></span>
+      <span id="catalog-meta" class="path-meta"></span>
+    </div>
+    <span id="zone-sep" class="path-sep zone-only">/</span>
+    <div id="zone-title" class="path-part zone-only">
+      <span id="zone-name" class="path-name"></span>
+      <span id="zone-meta" class="path-meta"></span>
+    </div>
+  </nav>
   <input id="filter" class="zone-only" type="search" placeholder="Filter records…" spellcheck="false">
   <button id="raw-btn" class="zone-only" aria-pressed="false" hidden title="Show the raw records of the catalog zone instead of its member zones">Raw records</button>
   <button id="add-btn" class="zone-only">+ Add record</button>

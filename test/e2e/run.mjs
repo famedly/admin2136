@@ -24,6 +24,10 @@ import tests from "./tests.mjs";
 import { textToRdata, parseGeneric, genericToText } from "../../js/rdata.js";
 import { nameToType } from "../../js/dnswire.js";
 
+// The name shown last in the toolbar path (the catalog in the catalog
+// view, else the zone), as a page expression.
+const SHOWN = `[...document.querySelectorAll("#path .path-part:not([hidden]) .path-name")].pop().textContent`;
+
 const root = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../..",
@@ -111,7 +115,7 @@ function helpers(b, env) {
       await t.open();
       await t.submitLogin({ zone, key });
       await b.wait(
-        `document.getElementById("zone-name").textContent === ${JSON.stringify(zone + ".")}`,
+        `${SHOWN} === ${JSON.stringify(zone + ".")}`,
         "zone view of " + zone,
       );
       await t.waitStatus("Zone loaded", "zone " + zone + " loaded");

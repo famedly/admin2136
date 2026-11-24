@@ -184,53 +184,57 @@ a {
     background: var(--bg-alt);
     border-bottom: 1px solid var(--border);
 }
-#brand {
+/* The path in the toolbar: app / catalog / zone, each as a name over a
+   smaller line (subtitle, or serial and size). */
+#path {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    min-width: 0;
+    margin-right: auto;
+}
+#toolbar [hidden] {
+    display: none;
+}
+.path-part {
     display: flex;
     flex-direction: column;
     line-height: 1.25;
     white-space: nowrap;
+    min-width: 0;
+    overflow: hidden;
 }
-#brand-name {
+.path-name {
     font-weight: 600;
     font-family: var(--mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
-#brand-sub {
+.path-meta {
     font-size: 11px;
     color: var(--fg-dim);
 }
-/* Zone controls only appear once a zone is loaded; the About button (and
-   the brand) stay visible on the login screen too. */
-#toolbar:not(.zone-active) .zone-only {
-    display: none;
+/* Tall slashes separating the parts of the path. */
+#brand {
+    flex-shrink: 0;
 }
-#toolbar:not(.zone-active) #about-btn {
-    margin-left: auto;
-}
-/* Tall slash separating the app title from the zone title. */
-#brand-sep {
+.path-sep {
     font-size: 28px;
     font-weight: 300;
     line-height: 1;
     color: var(--fg-dim);
     user-select: none;
 }
-#zone-title {
-    /* Two rows (zone name over record count / serial), matching #brand. */
-    display: flex;
-    flex-direction: column;
-    line-height: 1.25;
-    flex: 0 1 auto;
-    margin-right: auto;
-    white-space: nowrap;
-    overflow: hidden;
+/* In the zone view, the app leads back to the login screen, and the
+   catalog (when a member zone is shown) back to the catalog. */
+#toolbar.zone-active #brand,
+#catalog-title.link {
+    cursor: pointer;
 }
-#zone-name {
-    font-weight: 600;
-    font-family: var(--mono);
-}
-#zone-meta {
-    font-size: 11px;
-    color: var(--fg-dim);
+/* Zone controls only appear once a zone is loaded; the About button (and
+   the brand) stay visible on the login screen too. */
+#toolbar:not(.zone-active) .zone-only {
+    display: none;
 }
 #filter {
     width: 260px;

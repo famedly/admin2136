@@ -342,7 +342,7 @@ function startLoad(s, onStarted, c = null) {
       (n, serial) => {
         s.loadingSerial = serial;
         start();
-        if (s === cur) updateMeta();
+        if (s === cur) renderPath();
         setStatus(s, "Transferring zone… " + n + " records");
       },
       c,
@@ -432,21 +432,45 @@ function applyFilter(s) {
   if (s === cur) render();
 }
 
-function updateMeta() {
-  const s = cur;
-  let meta;
-  if (s.setup) {
-    meta = "no records yet";
-  } else if (s.loadingSerial !== null) {
-    meta = "serial " + s.loadingSerial;
-  } else {
-    meta = "serial " + (s.store.serial ?? "?") + " · ";
-    meta += s.catalog
+// The line under a zone name in the toolbar path: serial and size.
+function metaText(s) {
+  if (s.setup) return "no records yet";
+  if (s.loadingSerial !== null) return "serial " + s.loadingSerial;
+  return (
+    "serial " +
+    (s.store.serial ?? "?") +
+    " · " +
+    (s.catalog && !s.showRaw
       ? "catalog of " + s.catalog.members.length + " zones"
-      : s.store.count + " records";
-  }
-  $("zone-meta").textContent = meta;
+      : s.store.count + " records")
+  );
 }
+
+// The toolbar path: app / catalog / zone. The catalog view shows the
+// catalog only, a member zone opened from it is added after it, and the
+// raw records of a catalog (or a zone logged in to) show it as a zone.
+function renderPath() {
+  const s = cur;
+  const asCatalog = s.catalog !== null && !s.showRaw && !s.setup;
+  const catalog = asCatalog ? s : s.depth > 0 ? sessions[s.depth - 1] : null;
+  $("catalog-sep").hidden = $("catalog-title").hidden = !catalog;
+  $("zone-sep").hidden = $("zone-title").hidden = asCatalog;
+  if (catalog) {
+    $("catalog-name").textContent = catalog.store.zoneFqdn;
+    $("catalog-meta").textContent = metaText(catalog);
+    $("catalog-title").classList.toggle("link", catalog !== s);
+  }
+  if (!asCatalog) {
+    $("zone-name").textContent = s.store.zoneFqdn;
+    $("zone-meta").textContent = metaText(s);
+  }
+}
+
+// The catalog in the path leads back to it from a member zone, through
+// the history so that forward returns.
+$("catalog-title").addEventListener("click", () => {
+  if ($("catalog-title").classList.contains("link")) history.back();
+});
 
 // Bring the zone view in line with the current session.
 function render() {
@@ -458,7 +482,7 @@ function render() {
   $("raw-btn").setAttribute("aria-pressed", String(s.showRaw));
   $("add-btn").textContent = zones ? "+ Add zone" : "+ Add record";
   $("filter").placeholder = zones ? "Filter zones…" : "Filter records…";
-  updateMeta();
+  renderPath();
   if (zones) zlist.setCount(s.zoneView.length + s.drafts.length);
   else vlist.setCount(s.view ? s.view.length : s.order.length);
 }
@@ -476,13 +500,17 @@ function showSession(s) {
     vlist = new VirtualList($("record-list"), ROW_HEIGHT, renderRow);
     zlist = new VirtualList($("zone-list"), ROW_HEIGHT, renderZoneRow);
   }
-  $("zone-name").textContent = s.store.zoneFqdn;
   $("filter").value = s.filter;
   render();
   $("record-list").scrollTop = s.scroll.records;
   $("zone-list").scrollTop = s.scroll.zones;
   setStatus(s, s.status.text, s.status.cls);
 }
+
+// The brand leads back to the login screen.
+$("brand").addEventListener("click", () => {
+  if (!$("zone-view").hidden) history.go(-(cur.depth + 1));
+});
 
 // Switch to session `s` and give it its own history entry, so the browser
 // back button returns to where it was opened from (and forward returns
